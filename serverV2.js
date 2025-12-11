@@ -68,7 +68,20 @@ let isFirebaseInitialized = false;
 
 // Initialiser Firebase
 try {
-    const serviceAccountConfig = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    // Supporter plusieurs formats de configuration Firebase
+    let serviceAccountConfig = process.env.FIREBASE_SERVICE_ACCOUNT 
+        || process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 
+        || process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    
+    // Si c'est explicitement en Base64
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64 && !process.env.FIREBASE_SERVICE_ACCOUNT) {
+        console.log("📦 Decoding Firebase credentials from Base64...");
+        try {
+            serviceAccountConfig = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, 'base64').toString('utf8');
+        } catch (decodeError) {
+            console.error("❌ Failed to decode Base64:", decodeError.message);
+        }
+    }
     
     if (serviceAccountConfig) {
         initializeFirebase(serviceAccountConfig);
@@ -79,10 +92,12 @@ try {
         console.warn("⚠️ FIREBASE_SERVICE_ACCOUNT not set - running in MOCK mode");
         console.warn("   Pour connecter Firebase, ajoutez dans .env :");
         console.warn('   FIREBASE_SERVICE_ACCOUNT={"type":"service_account",...}');
+        console.warn('   ou FIREBASE_SERVICE_ACCOUNT_BASE64=<base64_encoded_json>');
     }
 } catch (error) {
     console.error("❌ Firebase initialization failed:", error.message);
     console.error("   Vérifiez votre configuration dans .env");
+    console.error("   Conseil: Essayez d'encoder votre serviceAccountKey.json en Base64");
 }
 
 // Initialiser le service de prédiction IA (Claude + DeepSeek avec Thinking)

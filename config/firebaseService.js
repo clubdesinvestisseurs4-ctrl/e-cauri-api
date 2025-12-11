@@ -23,24 +23,52 @@ function initializeFirebase(serviceAccount) {
     if (admin.apps.length === 0) {
         if (serviceAccount) {
             let credential;
+            let config;
             
-            // Si c'est une chaîne JSON
+            // Si c'est une chaîne
             if (typeof serviceAccount === 'string') {
                 try {
-                    credential = admin.credential.cert(JSON.parse(serviceAccount));
-                } catch {
-                    // Si c'est un chemin de fichier
-                    const fs = require('fs');
-                    const config = JSON.parse(fs.readFileSync(serviceAccount, 'utf8'));
-                    credential = admin.credential.cert(config);
+                    // Essayer de parser comme JSON direct
+                    config = JSON.parse(serviceAccount);
+                    console.log("✅ Firebase: Parsed JSON credentials");
+                } catch (parseError) {
+                    // Essayer comme Base64
+                    try {
+                        const decoded = Buffer.from(serviceAccount, 'base64').toString('utf8');
+                        config = JSON.parse(decoded);
+                        console.log("✅ Firebase: Decoded Base64 credentials");
+                    } catch (base64Error) {
+                        // Essayer comme chemin de fichier
+                        try {
+                            const fs = require('fs');
+                            config = JSON.parse(fs.readFileSync(serviceAccount, 'utf8'));
+                            console.log("✅ Firebase: Loaded from file path");
+                        } catch (fileError) {
+                            console.error("❌ Firebase: Could not parse credentials");
+                            console.error("   - Not valid JSON:", parseError.message);
+                            console.error("   - Not valid Base64:", base64Error.message);
+                            console.error("   - Not a valid file path:", fileError.message);
+                            throw new Error("Invalid Firebase credentials format");
+                        }
+                    }
                 }
             } else {
-                credential = admin.credential.cert(serviceAccount);
+                // C'est déjà un objet
+                config = serviceAccount;
             }
             
+            // Corriger les \n dans la clé privée si nécessaire
+            if (config.private_key && typeof config.private_key === 'string') {
+                config.private_key = config.private_key.replace(/\\n/g, '\n');
+            }
+            
+            credential = admin.credential.cert(config);
             admin.initializeApp({ credential });
+            
+            console.log(`✅ Firebase initialized with project: ${config.project_id}`);
         } else {
             admin.initializeApp();
+            console.log("✅ Firebase initialized with default credentials");
         }
     }
     
