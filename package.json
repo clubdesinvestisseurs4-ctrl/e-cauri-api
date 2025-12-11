@@ -1,0 +1,34 @@
+{
+  "name": "e-cauri-app-v3",
+  "version": "3.0.0",
+  "description": "E-Cauri - Application de paris sportifs intelligents avec IA (Claude + DeepSeek)",
+  "main": "serverV2.js",
+  "scripts": {
+    "start": "node serverV2.js",
+    "dev": "nodemon serverV2.js",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [
+    "betting",
+    "sports",
+    "ai",
+    "claude",
+    "deepseek",
+    "football"
+  ],
+  "author": "E-Cauri Team",
+  "license": "MIT",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

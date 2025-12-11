@@ -1,0 +1,49 @@
+# ============================================
+# RENDER.COM - Configuration de déploiement
+# ============================================
+# Ce fichier permet un déploiement automatique
+# Documentation: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: e-cauri-api
+    env: node
+    region: frankfurt  # Proche de l'Afrique de l'Ouest
+    plan: free         # Plan gratuit (500 heures/mois)
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    
+    # Variables d'environnement
+    # ⚠️ Les valeurs "sync: false" doivent être configurées manuellement
+    # dans le dashboard Render après le premier déploiement
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
+        
+      # Firebase - À configurer dans le dashboard
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+        
+      # API Football - À configurer dans le dashboard  
+      - key: API_FOOTBALL_KEY
+        sync: false
+        
+      # Claude AI - À configurer dans le dashboard
+      - key: ANTHROPIC_API_KEY
+        sync: false
+        
+      # DeepSeek AI (optionnel) - À configurer dans le dashboard
+      - key: DEEPSEEK_API_KEY
+        sync: false
+        
+      # CORS - À mettre à jour avec votre domaine Vercel
+      - key: ALLOWED_ORIGINS
+        sync: false
+
+# Notes:
+# - Le plan gratuit met le service en veille après 15 min d'inactivité
+# - Le premier appel après veille peut prendre 30-60 secondes
+# - Pour éviter cela, utilisez un service de ping ou passez au plan payant
