@@ -128,7 +128,7 @@ const authMiddleware = async (req, res, next) => {
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: "Unauthorized - No token provided" });
+        return res.status(401).json({ error: "Unauthorized - No token provided", code: "NO_TOKEN" });
     }
 
     const token = authHeader.split('Bearer ')[1];
@@ -152,7 +152,24 @@ const authMiddleware = async (req, res, next) => {
         next();
     } catch (error) {
         console.error("Auth error:", error.message);
-        return res.status(401).json({ error: "Unauthorized - Invalid token" });
+        
+        // Distinguer les types d'erreur pour le frontend
+        if (error.code === 'auth/id-token-expired') {
+            return res.status(401).json({ 
+                error: "Token expired - Please refresh", 
+                code: "TOKEN_EXPIRED" 
+            });
+        } else if (error.code === 'auth/argument-error' || error.code === 'auth/invalid-id-token') {
+            return res.status(401).json({ 
+                error: "Invalid token format", 
+                code: "INVALID_TOKEN" 
+            });
+        } else {
+            return res.status(401).json({ 
+                error: "Unauthorized - " + error.message, 
+                code: "AUTH_ERROR" 
+            });
+        }
     }
 };
 
