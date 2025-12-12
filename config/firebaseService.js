@@ -433,10 +433,36 @@ class FirestoreService {
      * Met à jour une prédiction
      */
     async updatePrediction(predictionId, updateData) {
-        await this.db.collection('predictions').doc(predictionId).update({
+        // Utiliser set avec merge pour créer le document s'il n'existe pas
+        await this.db.collection('predictions').doc(predictionId).set({
             ...updateData,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        });
+        }, { merge: true });
+    }
+
+    /**
+     * Met à jour ou crée une prédiction (upsert)
+     */
+    async upsertPrediction(predictionId, predictionData) {
+        const docRef = this.db.collection('predictions').doc(predictionId);
+        const doc = await docRef.get();
+        
+        if (doc.exists) {
+            // Mettre à jour
+            await docRef.update({
+                ...predictionData,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        } else {
+            // Créer
+            await docRef.set({
+                ...predictionData,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        }
+        
+        return { id: predictionId, ...predictionData };
     }
 
     /**

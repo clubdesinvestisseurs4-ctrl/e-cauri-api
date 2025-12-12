@@ -503,42 +503,62 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
         console.log(`   Capital: ${userBalance} FCFA`);
         console.log(`   Bookmaker: ${bookmaker || 'default'}`);
 
-        // Log de l'action
-        if (firestoreService) {
-            await firestoreService.logUserAction(req.user.uid, 'start_analysis', {
-                opportunityId,
-                userBalance,
-                bookmaker
-            }, { opportunityId });
+        // Log de l'action (avec try-catch pour éviter les erreurs)
+        try {
+            if (firestoreService) {
+                await firestoreService.logUserAction(req.user.uid, 'start_analysis', {
+                    opportunityId,
+                    userBalance,
+                    bookmaker
+                }, { opportunityId });
+            }
+        } catch (logError) {
+            console.warn("⚠️ Could not log action:", logError.message);
         }
 
         // Récupérer les données de l'opportunité depuis Firebase
         let matchData;
-        if (firestoreService) {
-            matchData = await firestoreService.getOpportunityById(opportunityId);
-            if (!matchData) {
-                return res.status(404).json({ error: "Opportunity not found" });
+        try {
+            if (firestoreService) {
+                matchData = await firestoreService.getOpportunityById(opportunityId);
+                if (!matchData) {
+                    console.warn("⚠️ Opportunity not found in Firebase, using mock data");
+                    matchData = { ...getMockMatchData(), id: opportunityId };
+                }
+            } else {
+                console.log("📦 Using mock match data (Firebase not configured)");
+                matchData = { ...getMockMatchData(), id: opportunityId };
             }
-        } else {
+        } catch (fetchError) {
+            console.error("❌ Error fetching opportunity:", fetchError.message);
             matchData = { ...getMockMatchData(), id: opportunityId };
         }
 
         // Lancer le pipeline de prédiction IA (Claude + DeepSeek avec Thinking)
         let prediction;
-        if (predictionService) {
-            console.log(`\n🧠 Using AI Engines:`);
-            console.log(`   - Claude (claude-sonnet-4-20250514) with Extended Thinking`);
-            console.log(`   - DeepSeek (deepseek-reasoner) with Reasoning`);
-            
-            prediction = await predictionService.runFullPrediction(
-                matchData,
-                userBalance,
-                bookmaker || 'default'
-            );
-        } else {
-            // Mock prediction
-            console.log(`⚠️ Using mock prediction (AI not configured)`);
+        try {
+            if (predictionService) {
+                console.log(`\n🧠 Using AI Engines:`);
+                console.log(`   - Claude (claude-sonnet-4-20250514) with Extended Thinking`);
+                console.log(`   - DeepSeek (deepseek-reasoner) with Reasoning`);
+                
+                prediction = await predictionService.runFullPrediction(
+                    matchData,
+                    userBalance,
+                    bookmaker || 'default'
+                );
+            } else {
+                // Mock prediction car IA non configurée
+                console.log(`⚠️ Using mock prediction (AI not configured)`);
+                prediction = generateMockPrediction(matchData, userBalance, bookmaker);
+            }
+        } catch (aiError) {
+            // Si l'IA échoue, utiliser le mock
+            console.error("❌ AI prediction failed:", aiError.message);
+            console.log("📦 Falling back to mock prediction");
             prediction = generateMockPrediction(matchData, userBalance, bookmaker);
+            prediction.aiError = aiError.message;
+            prediction.isDemo = true;
         }
 
         // ========== CALCUL DES STAKES SI VIDES ==========
@@ -548,7 +568,6 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
             
             const options = prediction.oddsAnalysis.recommendedOptions;
             const maxBudget = Math.round(userBalance * 0.06); // 6% du capital
-            const homeTeam = matchData.homeTeam || 'Équipe A';
             
             // Calculer les stakes basées sur Kelly simplifié
             const calculatedStakes = options.slice(0, 3).map((opt, index) => {
@@ -600,22 +619,23 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
             userId: req.user.uid,
             opportunityId,
             matchInfo: {
-                homeTeam: matchData.homeTeam,
-                awayTeam: matchData.awayTeam,
-                fixtureId: matchData.fixtureId,
-                league: matchData.league,
-                matchDate: matchData.matchDate
+                homeTeam: matchData.homeTeam || 'Équipe A',
+                awayTeam: matchData.awayTeam || 'Équipe B',
+                fixtureId: matchData.fixtureId || matchData.id,
+                league: matchData.league || 'Championnat',
+                matchDate: matchData.matchDate || new Date().toISOString()
             },
             userBalance,
             bookmaker: bookmaker || 'default',
-            aiAnalysis: prediction.matchAnalysis,
-            oddsAnalysis: prediction.oddsAnalysis,
-            synthesis: prediction.synthesis,
-            stakes: prediction.stakes,
-            selectedBookmaker: prediction.selectedBookmaker,
+            aiAnalysis: prediction.matchAnalysis || null,
+            oddsAnalysis: prediction.oddsAnalysis || null,
+            synthesis: prediction.synthesis || null,
+            stakes: prediction.stakes || null,
+            selectedBookmaker: prediction.selectedBookmaker || null,
             selectedOptions: [],
             status: 'analyzed', // Analyse terminée, en attente de validation
             analyzedAt: new Date().toISOString(),
+            isDemo: prediction.isDemo || false,
             aiEngines: {
                 primary: "Claude (Extended Thinking)",
                 secondary: "DeepSeek (Reasoner)"
@@ -623,21 +643,31 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
         };
 
         let savedPrediction;
-        if (firestoreService) {
-            savedPrediction = await firestoreService.createPrediction(predictionData);
-            
-            // Envoyer une notification que l'analyse est terminée
-            await sendNotificationToUser(req.user.uid, {
-                type: 'analysis_complete',
-                title: '✅ Analyse terminée',
-                body: `L'analyse de ${matchData.homeTeam} vs ${matchData.awayTeam} est prête.`,
-                data: { 
-                    predictionId: savedPrediction.id,
-                    matchInfo: `${matchData.homeTeam} vs ${matchData.awayTeam}`
+        try {
+            if (firestoreService) {
+                savedPrediction = await firestoreService.createPrediction(predictionData);
+                
+                // Envoyer une notification que l'analyse est terminée
+                try {
+                    await sendNotificationToUser(req.user.uid, {
+                        type: 'analysis_complete',
+                        title: '✅ Analyse terminée',
+                        body: `L'analyse de ${matchData.homeTeam || 'Match'} vs ${matchData.awayTeam || ''} est prête.`,
+                        data: { 
+                            predictionId: savedPrediction.id,
+                            matchInfo: `${matchData.homeTeam || 'Match'} vs ${matchData.awayTeam || ''}`
+                        }
+                    });
+                } catch (notifError) {
+                    console.warn("⚠️ Could not send notification:", notifError.message);
                 }
-            });
-        } else {
-            savedPrediction = { id: `pred_${Date.now()}`, ...predictionData };
+            } else {
+                savedPrediction = { id: `pred_${Date.now()}`, ...predictionData };
+            }
+        } catch (saveError) {
+            console.error("❌ Error saving prediction to Firebase:", saveError.message);
+            // Retourner quand même la prédiction sans la sauvegarder
+            savedPrediction = { id: `temp_${Date.now()}`, ...predictionData, saveError: saveError.message };
         }
 
         console.log(`✅ Analysis complete! Prediction ID: ${savedPrediction.id}\n`);
@@ -645,8 +675,30 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
         res.json({ prediction: savedPrediction });
 
     } catch (error) {
-        console.error("Error analyzing prediction:", error);
-        res.status(500).json({ error: "Failed to analyze prediction", details: error.message });
+        console.error("❌ Error analyzing prediction:", error);
+        console.error("   Stack:", error.stack);
+        
+        // Retourner une prédiction mock en cas d'erreur totale
+        try {
+            const mockPrediction = generateMockPrediction(
+                { homeTeam: 'Équipe A', awayTeam: 'Équipe B', id: req.body.opportunityId },
+                req.body.userBalance || 10000,
+                req.body.bookmaker
+            );
+            mockPrediction.id = `error_${Date.now()}`;
+            mockPrediction.isDemo = true;
+            mockPrediction.error = error.message;
+            
+            console.log("📦 Returning mock prediction due to error");
+            return res.json({ prediction: mockPrediction, isDemo: true, error: error.message });
+        } catch (mockError) {
+            // Si même le mock échoue, retourner l'erreur
+            res.status(500).json({ 
+                error: "Failed to analyze prediction", 
+                details: error.message,
+                suggestion: "Vérifiez que les clés API sont configurées sur Render"
+            });
+        }
     }
 });
 
@@ -776,77 +828,150 @@ function getMockMatchData() {
 /**
  * PUT /api/predictions/:id/select-options
  * Enregistre les options sélectionnées par l'utilisateur
+ * Crée la prédiction si elle n'existe pas (cas des prédictions demo_)
  */
 app.put('/api/predictions/:id/select-options', authMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
-        const { selectedOptions } = req.body;
+        const { selectedOptions, predictionData } = req.body;
 
         if (!selectedOptions || !Array.isArray(selectedOptions)) {
             return res.status(400).json({ error: "selectedOptions array is required" });
         }
 
-        // Log de l'action
+        console.log(`📋 Selecting options for prediction ${id}`);
+        console.log(`   Options: ${selectedOptions.length} selected`);
+
         if (firestoreService) {
-            await firestoreService.logUserAction(req.user.uid, 'select_options', {
-                predictionId: id,
-                selectedOptions
-            }, { predictionId: id });
+            // Log de l'action
+            try {
+                await firestoreService.logUserAction(req.user.uid, 'select_options', {
+                    predictionId: id,
+                    optionsCount: selectedOptions.length
+                }, { predictionId: id });
+            } catch (logError) {
+                console.warn("⚠️ Could not log action:", logError.message);
+            }
 
-            // Mettre à jour la prédiction
-            await firestoreService.updatePrediction(id, {
-                selectedOptions,
-                status: 'active',
-                validatedAt: new Date().toISOString()
-            });
+            // Vérifier si la prédiction existe
+            let existingPrediction = await firestoreService.getPredictionById(id);
+            
+            if (!existingPrediction) {
+                // La prédiction n'existe pas (cas demo_) - la créer
+                console.log(`📝 Creating new prediction document: ${id}`);
+                
+                const newPredictionData = {
+                    userId: req.user.uid,
+                    selectedOptions,
+                    status: 'active',
+                    validatedAt: new Date().toISOString(),
+                    // Inclure les données additionnelles si fournies
+                    ...(predictionData || {}),
+                    isDemo: id.startsWith('demo_') || id.startsWith('temp_') || id.startsWith('error_')
+                };
+                
+                await firestoreService.db.collection('predictions').doc(id).set({
+                    ...newPredictionData,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                existingPrediction = { id, ...newPredictionData };
+            } else {
+                // Mettre à jour la prédiction existante
+                await firestoreService.updatePrediction(id, {
+                    selectedOptions,
+                    status: 'active',
+                    validatedAt: new Date().toISOString()
+                });
+                
+                existingPrediction = await firestoreService.getPredictionById(id);
+            }
 
-            const updatedPrediction = await firestoreService.getPredictionById(id);
-            res.json({ prediction: updatedPrediction });
+            console.log(`✅ Options saved for prediction ${id}`);
+            res.json({ prediction: existingPrediction });
         } else {
             res.json({ prediction: { id, selectedOptions, status: 'active' } });
         }
 
     } catch (error) {
         console.error("Error selecting options:", error);
-        res.status(500).json({ error: "Failed to select options" });
+        res.status(500).json({ error: "Failed to select options", details: error.message });
     }
 });
 
 /**
  * POST /api/predictions/:id/validate
- * Alias pour select-options (utilisé par le frontend)
+ * Valide les options sélectionnées par l'utilisateur
+ * Crée la prédiction si elle n'existe pas (cas des prédictions demo_)
  */
 app.post('/api/predictions/:id/validate', authMiddleware, async (req, res) => {
     try {
         const { id } = req.params;
-        const { selectedOptions } = req.body;
+        const { selectedOptions, predictionData } = req.body;
 
         if (!selectedOptions || !Array.isArray(selectedOptions)) {
             return res.status(400).json({ error: "selectedOptions array is required" });
         }
 
+        console.log(`✅ Validating options for prediction ${id}`);
+        console.log(`   Options: ${selectedOptions.length} validated`);
+
         if (firestoreService) {
-            await firestoreService.logUserAction(req.user.uid, 'validate_options', {
-                predictionId: id,
-                optionsCount: selectedOptions.length
-            }, { predictionId: id });
+            // Log de l'action
+            try {
+                await firestoreService.logUserAction(req.user.uid, 'validate_options', {
+                    predictionId: id,
+                    optionsCount: selectedOptions.length
+                }, { predictionId: id });
+            } catch (logError) {
+                console.warn("⚠️ Could not log action:", logError.message);
+            }
 
-            // Mettre à jour la prédiction avec les options validées
-            await firestoreService.updatePrediction(id, {
-                selectedOptions,
-                status: 'active',
-                validatedAt: new Date().toISOString()
-            });
+            // Vérifier si la prédiction existe
+            let existingPrediction = await firestoreService.getPredictionById(id);
+            
+            if (!existingPrediction) {
+                // La prédiction n'existe pas (cas demo_) - la créer
+                console.log(`📝 Creating new prediction document: ${id}`);
+                
+                const newPredictionData = {
+                    userId: req.user.uid,
+                    selectedOptions,
+                    status: 'active',
+                    validatedAt: new Date().toISOString(),
+                    // Inclure les données additionnelles si fournies
+                    ...(predictionData || {}),
+                    isDemo: id.startsWith('demo_') || id.startsWith('temp_') || id.startsWith('error_')
+                };
+                
+                await firestoreService.db.collection('predictions').doc(id).set({
+                    ...newPredictionData,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                existingPrediction = { id, ...newPredictionData };
+            } else {
+                // Mettre à jour la prédiction existante
+                await firestoreService.updatePrediction(id, {
+                    selectedOptions,
+                    status: 'active',
+                    validatedAt: new Date().toISOString()
+                });
+                
+                existingPrediction = await firestoreService.getPredictionById(id);
+            }
 
-            const updatedPrediction = await firestoreService.getPredictionById(id);
-            res.json({ success: true, prediction: updatedPrediction });
+            console.log(`✅ Options validated for prediction ${id}`);
+            res.json({ success: true, prediction: existingPrediction });
         } else {
             res.json({ success: true, prediction: { id, selectedOptions, status: 'active' } });
         }
 
     } catch (error) {
         console.error("Error validating options:", error);
-        res.status(500).json({ error: "Failed to validate options" });
+        res.status(500).json({ error: "Failed to validate options", details: error.message });
     }
 });
 
