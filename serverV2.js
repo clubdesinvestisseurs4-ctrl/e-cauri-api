@@ -1431,8 +1431,24 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                     body: `Recommandation: ${strategy.recommendation?.toUpperCase() || 'ANALYSER'}`,
                     data: { predictionId }
                 });
+                
+                // ========== VERROUILLER L'ANALYSE DE COUVERTURE ==========
+                // Marquer la prédiction comme ayant reçu une analyse de couverture
+                await firestoreService.updatePrediction(predictionId, {
+                    hedgingAnalyzed: true,
+                    hedgingAnalyzedAt: new Date().toISOString(),
+                    hedgingStrategy: strategy,
+                    hedgingLiveData: {
+                        score: currentScore,
+                        elapsed: currentElapsed,
+                        statistics: liveData?.statistics || null,
+                        odds: liveData?.odds || null
+                    }
+                });
+                console.log(`✅ Prediction ${predictionId} marked as hedgingAnalyzed`);
+                
             } catch (notifError) {
-                console.warn("Could not send notification:", notifError.message);
+                console.warn("Could not send notification or update prediction:", notifError.message);
             }
         }
 
@@ -1441,9 +1457,12 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
             liveData: {
                 score: `${currentScore.home || 0} - ${currentScore.away || 0}`,
                 matchTime: `${currentElapsed}'`,
-                status: matchStatus?.statusLong || 'En cours'
+                status: matchStatus?.statusLong || 'En cours',
+                statistics: liveData?.statistics || null,
+                odds: liveData?.odds || null
             },
-            hedgingAllowed: true
+            hedgingAllowed: true,
+            hedgingAnalyzed: true  // Indiquer que l'analyse est faite
         });
 
     } catch (error) {
@@ -1622,6 +1641,251 @@ app.post('/api/hedging/apply', authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Error applying hedging:", error);
         res.status(500).json({ error: "Failed to apply hedging" });
+    }
+});
+
+/**
+ * POST /api/hedging/break-even
+ * Calcule les mises de couverture pour sortir à break-even
+ * Utilise les cotes live actuelles
+ */
+app.post('/api/hedging/break-even', authMiddleware, async (req, res) => {
+    try {
+        const { predictionId } = req.body;
+
+        if (!predictionId) {
+            return res.status(400).json({ error: "predictionId is required" });
+        }
+
+        // Récupérer la prédiction
+        let prediction;
+        if (firestoreService) {
+            prediction = await firestoreService.getPredictionById(predictionId);
+            if (!prediction) {
+                return res.status(404).json({ error: "Prediction not found" });
+            }
+        } else {
+            prediction = {
+                matchInfo: { fixtureId: 123456, homeTeam: "PSG", awayTeam: "Marseille" },
+                selectedOptions: [{ option: "Plus de 2.5 buts", stake: 500, odds: 1.70 }]
+            };
+        }
+
+        const fixtureId = prediction.matchInfo?.fixtureId || prediction.meta?.matchId;
+        const selectedOptions = prediction.selectedOptions || [];
+
+        if (selectedOptions.length === 0) {
+            return res.status(400).json({ error: "No selected options found" });
+        }
+
+        // ========== RÉCUPÉRER LES COTES LIVE ==========
+        let liveOdds = null;
+        let matchStatus = null;
+        
+        if (liveFootballService && fixtureId) {
+            try {
+                // Récupérer le statut du match
+                matchStatus = await liveFootballService.getMatchStatus(parseInt(fixtureId));
+                
+                // Récupérer les cotes live
+                const liveData = await liveFootballService.getFullLiveData(parseInt(fixtureId));
+                
+                if (liveData?.odds) {
+                    // Parser les cotes live
+                    liveOdds = {};
+                    const bookmakerOdds = liveData.odds[0]?.bookmakers?.[0]?.bets || [];
+                    
+                    bookmakerOdds.forEach(bet => {
+                        const betName = bet.name?.toLowerCase() || '';
+                        
+                        // Goals Over/Under
+                        if (betName.includes('over') || betName.includes('under') || betName.includes('goals')) {
+                            liveOdds.goals = liveOdds.goals || {};
+                            bet.values?.forEach(v => {
+                                if (v.value?.toLowerCase().includes('over')) {
+                                    const line = v.value.match(/[\d.]+/)?.[0] || '2.5';
+                                    liveOdds.goals.over = liveOdds.goals.over || {};
+                                    liveOdds.goals.over[line] = parseFloat(v.odd);
+                                } else if (v.value?.toLowerCase().includes('under')) {
+                                    const line = v.value.match(/[\d.]+/)?.[0] || '2.5';
+                                    liveOdds.goals.under = liveOdds.goals.under || {};
+                                    liveOdds.goals.under[line] = parseFloat(v.odd);
+                                }
+                            });
+                        }
+                        
+                        // BTTS
+                        if (betName.includes('both') || betName.includes('btts')) {
+                            bet.values?.forEach(v => {
+                                if (v.value?.toLowerCase() === 'yes') {
+                                    liveOdds.bttsYes = parseFloat(v.odd);
+                                } else if (v.value?.toLowerCase() === 'no') {
+                                    liveOdds.bttsNo = parseFloat(v.odd);
+                                }
+                            });
+                        }
+                        
+                        // Match Winner (1X2)
+                        if (betName.includes('winner') || betName === 'match winner') {
+                            bet.values?.forEach(v => {
+                                if (v.value === 'Home') liveOdds.home = parseFloat(v.odd);
+                                else if (v.value === 'Draw') liveOdds.draw = parseFloat(v.odd);
+                                else if (v.value === 'Away') liveOdds.away = parseFloat(v.odd);
+                            });
+                        }
+                        
+                        // Double Chance
+                        if (betName.includes('double chance')) {
+                            liveOdds.doubleChance = liveOdds.doubleChance || {};
+                            bet.values?.forEach(v => {
+                                if (v.value === 'Home/Draw' || v.value === '1X') liveOdds.doubleChance['1X'] = parseFloat(v.odd);
+                                else if (v.value === 'Home/Away' || v.value === '12') liveOdds.doubleChance['12'] = parseFloat(v.odd);
+                                else if (v.value === 'Draw/Away' || v.value === 'X2') liveOdds.doubleChance['X2'] = parseFloat(v.odd);
+                            });
+                        }
+                    });
+                }
+                
+                console.log("📊 Live odds retrieved:", liveOdds);
+                
+            } catch (error) {
+                console.warn("⚠️ Could not fetch live odds:", error.message);
+            }
+        }
+
+        // ========== CALCULER LES MISES DE COUVERTURE ==========
+        const breakEvenBets = [];
+        const totalInvested = selectedOptions.reduce((sum, opt) => sum + (opt.stake || 0), 0);
+        
+        for (const opt of selectedOptions) {
+            const stake = opt.stake || 0;
+            const originalOdds = opt.odds || 1.5;
+            const potentialReturn = stake * originalOdds;
+            const optionLower = (opt.option || '').toLowerCase();
+            
+            let oppositeBet = null;
+            let oppositeOdds = null;
+            
+            // Déterminer le pari opposé et sa cote
+            if (optionLower.includes('plus de') || optionLower.includes('over')) {
+                const goals = optionLower.match(/(\d+\.?\d*)/)?.[1] || '2.5';
+                oppositeBet = `Moins de ${goals} buts`;
+                oppositeOdds = liveOdds?.goals?.under?.[goals] || liveOdds?.goals?.under?.['2.5'] || 2.0;
+            } 
+            else if (optionLower.includes('moins de') || optionLower.includes('under')) {
+                const goals = optionLower.match(/(\d+\.?\d*)/)?.[1] || '2.5';
+                oppositeBet = `Plus de ${goals} buts`;
+                oppositeOdds = liveOdds?.goals?.over?.[goals] || liveOdds?.goals?.over?.['2.5'] || 2.0;
+            }
+            else if (optionLower.includes('btts') && optionLower.includes('oui')) {
+                oppositeBet = 'BTTS Non';
+                oppositeOdds = liveOdds?.bttsNo || 1.8;
+            }
+            else if (optionLower.includes('btts') && optionLower.includes('non')) {
+                oppositeBet = 'BTTS Oui';
+                oppositeOdds = liveOdds?.bttsYes || 2.0;
+            }
+            else if (optionLower.includes('victoire') && (optionLower.includes('domicile') || optionLower.includes('1'))) {
+                oppositeBet = 'Double Chance X2';
+                oppositeOdds = liveOdds?.doubleChance?.['X2'] || 1.5;
+            }
+            else if (optionLower.includes('victoire') && (optionLower.includes('extérieur') || optionLower.includes('2'))) {
+                oppositeBet = 'Double Chance 1X';
+                oppositeOdds = liveOdds?.doubleChance?.['1X'] || 1.4;
+            }
+            else if (optionLower.includes('nul') || optionLower.includes('match nul')) {
+                oppositeBet = 'Double Chance 12 (pas de nul)';
+                oppositeOdds = liveOdds?.doubleChance?.['12'] || 1.3;
+            }
+            
+            if (oppositeBet && oppositeOdds) {
+                // Formule Break-Even: hedgeStake = potentialReturn / oppositeOdds
+                const hedgeStake = Math.ceil(potentialReturn / oppositeOdds);
+                const hedgeReturn = hedgeStake * oppositeOdds;
+                
+                // Scénarios
+                const scenarioOriginalWins = potentialReturn - stake - hedgeStake;  // Pari original gagne
+                const scenarioHedgeWins = hedgeReturn - stake - hedgeStake;         // Pari de couverture gagne
+                
+                breakEvenBets.push({
+                    originalOption: opt.option,
+                    originalStake: stake,
+                    originalOdds: originalOdds,
+                    potentialReturn: Math.round(potentialReturn),
+                    oppositeBet,
+                    oppositeOdds: Math.round(oppositeOdds * 100) / 100,
+                    hedgeStake: Math.round(hedgeStake),
+                    hedgeReturn: Math.round(hedgeReturn),
+                    scenarios: {
+                        originalWins: Math.round(scenarioOriginalWins),
+                        hedgeWins: Math.round(scenarioHedgeWins),
+                        difference: Math.abs(Math.round(scenarioOriginalWins - scenarioHedgeWins))
+                    },
+                    isBreakEven: Math.abs(scenarioOriginalWins - scenarioHedgeWins) < 50
+                });
+            } else {
+                // Pas de couverture possible pour cette option
+                breakEvenBets.push({
+                    originalOption: opt.option,
+                    originalStake: stake,
+                    originalOdds: originalOdds,
+                    potentialReturn: Math.round(potentialReturn),
+                    oppositeBet: null,
+                    error: "Cote opposée non disponible en live"
+                });
+            }
+        }
+        
+        // Calculer le total
+        const totalHedgeRequired = breakEvenBets.reduce((sum, b) => sum + (b.hedgeStake || 0), 0);
+        const worstCaseWithHedge = Math.min(
+            ...breakEvenBets.filter(b => b.scenarios).map(b => b.scenarios.hedgeWins)
+        );
+        const bestCaseWithHedge = Math.max(
+            ...breakEvenBets.filter(b => b.scenarios).map(b => b.scenarios.originalWins)
+        );
+        
+        // Log de l'action
+        if (firestoreService) {
+            try {
+                await firestoreService.logUserAction(req.user.uid, 'calculate_break_even', {
+                    predictionId,
+                    totalInvested,
+                    totalHedgeRequired,
+                    betsCount: breakEvenBets.length
+                }, { predictionId });
+            } catch (logError) {
+                console.warn("Could not log action:", logError.message);
+            }
+        }
+
+        console.log(`✅ Break-even calculated for ${breakEvenBets.length} options`);
+        
+        res.json({
+            success: true,
+            breakEvenBets,
+            summary: {
+                totalInvested,
+                totalHedgeRequired,
+                totalAtRisk: totalInvested + totalHedgeRequired,
+                worstCaseWithHedge: isFinite(worstCaseWithHedge) ? worstCaseWithHedge : 0,
+                bestCaseWithHedge: isFinite(bestCaseWithHedge) ? bestCaseWithHedge : 0,
+                liveOddsAvailable: !!liveOdds
+            },
+            matchStatus: matchStatus ? {
+                score: matchStatus.score,
+                elapsed: matchStatus.elapsed,
+                status: matchStatus.statusLong
+            } : null,
+            liveOdds
+        });
+
+    } catch (error) {
+        console.error("❌ Error calculating break-even:", error);
+        res.status(500).json({ 
+            error: "Failed to calculate break-even", 
+            details: error.message 
+        });
     }
 });
 
