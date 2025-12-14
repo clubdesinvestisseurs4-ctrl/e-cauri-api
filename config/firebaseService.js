@@ -217,36 +217,54 @@ class FirestoreService {
             const now = new Date();
             const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000); // 3h avant maintenant
             
-            // Statuts indiquant un match terminé
-            const finishedStatuses = ['FT', 'AET', 'PEN', 'CANC', 'ABD', 'AWD', 'WO', 'PST', 'INT', 'finished', 'ended', 'terminated'];
+            // Statuts indiquant un match TERMINÉ (comparaison exacte)
+            const finishedStatuses = ['FT', 'AET', 'PEN', 'CANC', 'ABD', 'AWD', 'WO', 'INT', 'SUSP', 'PST'];
+            
+            // Statuts indiquant un match À VENIR ou EN COURS (à garder)
+            const validStatuses = ['NS', 'TBD', 'PENDING', '1H', '2H', 'HT', 'ET', 'BT', 'P', 'LIVE', 'UPCOMING'];
             
             const upcoming = opportunities.filter(opp => {
                 // Vérifier le statut du match (plusieurs sources possibles)
                 const matchStatus = (
-                    opp.status || 
                     opp._raw?.STATUS_MATCH?.short || 
-                    opp._raw?.STATUS_MATCH?.long ||
                     opp._raw?.fixture?.status?.short ||
+                    opp.status || 
                     ''
-                ).toUpperCase();
+                ).toUpperCase().trim();
                 
-                // Exclure les matchs avec statut terminé
-                if (finishedStatuses.some(s => matchStatus.includes(s.toUpperCase()))) {
+                // Si le statut est explicitement terminé, exclure
+                if (finishedStatuses.includes(matchStatus)) {
                     console.log(`   ⏭️ Skipping finished match: ${opp.homeTeam} vs ${opp.awayTeam} (status: ${matchStatus})`);
                     return false;
                 }
                 
-                // Vérifier la date du match
-                if (opp.matchDate) {
-                    const matchDate = new Date(opp.matchDate);
-                    
-                    // Exclure si le match a commencé il y a plus de 3h (probablement terminé)
-                    if (matchDate < threeHoursAgo) {
-                        console.log(`   ⏭️ Skipping old match: ${opp.homeTeam} vs ${opp.awayTeam} (date: ${matchDate.toISOString()})`);
-                        return false;
+                // Si le statut est valide (à venir ou en cours), garder
+                if (validStatuses.includes(matchStatus) || matchStatus === '' || matchStatus === 'UPCOMING') {
+                    // Vérifier quand même la date
+                    if (opp.matchDate) {
+                        const matchDate = new Date(opp.matchDate);
+                        
+                        // Exclure si le match devait commencer il y a plus de 3h (probablement terminé sans mise à jour du statut)
+                        if (matchDate < threeHoursAgo) {
+                            console.log(`   ⏭️ Skipping old match: ${opp.homeTeam} vs ${opp.awayTeam} (started ${Math.round((now - matchDate) / 3600000)}h ago)`);
+                            return false;
+                        }
                     }
+                    return true;
                 }
                 
+                // Pour tout autre statut, vérifier la date
+                if (opp.matchDate) {
+                    const matchDate = new Date(opp.matchDate);
+                    if (matchDate < threeHoursAgo) {
+                        console.log(`   ⏭️ Skipping old match: ${opp.homeTeam} vs ${opp.awayTeam} (status: ${matchStatus}, date passed)`);
+                        return false;
+                    }
+                    // Le match est dans le futur ou récent, le garder
+                    return true;
+                }
+                
+                // Pas de date et statut inconnu, garder par défaut
                 return true;
             });
 
