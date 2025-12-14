@@ -1289,8 +1289,39 @@ app.post('/api/hedging/strategy', authMiddleware, async (req, res) => {
 
                 // Récupérer les données live complètes
                 liveData = await liveFootballService.getFullLiveData(parseInt(fixtureId));
+                
+                // Si pas de cotes live, essayer les cotes pré-match
+                if (!liveData?.odds || liveData.odds.length === 0) {
+                    console.log("⚠️ No live odds, trying pre-match odds...");
+                    try {
+                        const preMatchOdds = await liveFootballService.getPreMatchOdds(parseInt(fixtureId));
+                        if (preMatchOdds) {
+                            liveData = liveData || {};
+                            liveData.preMatchOdds = preMatchOdds;
+                            console.log("✅ Pre-match odds retrieved");
+                        }
+                    } catch (oddsError) {
+                        console.warn("Could not get pre-match odds:", oddsError.message);
+                    }
+                } else {
+                    console.log("✅ Live odds available:", Object.keys(liveData.odds[0]?.bookmakers || {}).length, "bookmakers");
+                }
             } catch (error) {
                 console.warn("⚠️ Could not fetch live data:", error.message);
+            }
+        }
+
+        // Formater les cotes pour le prompt
+        let oddsDescription = "Non disponibles";
+        if (liveData?.odds && liveData.odds.length > 0) {
+            const firstBookmaker = liveData.odds[0];
+            oddsDescription = `Cotes LIVE: ${JSON.stringify(firstBookmaker.bookmakers || {}, null, 2)}`;
+        } else if (liveData?.preMatchOdds) {
+            // Prendre le premier bookmaker des cotes pré-match
+            const bookmakerNames = Object.keys(liveData.preMatchOdds);
+            if (bookmakerNames.length > 0) {
+                const firstBm = bookmakerNames[0];
+                oddsDescription = `Cotes pré-match (${firstBm}): ${JSON.stringify(liveData.preMatchOdds[firstBm], null, 2)}`;
             }
         }
 
@@ -1337,8 +1368,8 @@ ${optionsToAnalyze.map((opt, i) => `
 ## STATS LIVE
 ${liveData?.statistics ? JSON.stringify(LiveFootballService.formatLiveStatsForDisplay(liveData.statistics), null, 2) : 'Non disponibles'}
 
-## COTES LIVE
-${liveData?.odds ? JSON.stringify(liveData.odds[0]?.bookmakers?.[0] || {}, null, 2) : 'Non disponibles'}
+## COTES DISPONIBLES
+${oddsDescription}
 
 ## INSTRUCTIONS
 1. Analyse chaque option par rapport au score actuel et au temps restant
@@ -1442,7 +1473,8 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                         score: currentScore,
                         elapsed: currentElapsed,
                         statistics: liveData?.statistics || null,
-                        odds: liveData?.odds || null
+                        odds: liveData?.odds || null,
+                        preMatchOdds: liveData?.preMatchOdds || null
                     }
                 });
                 console.log(`✅ Prediction ${predictionId} marked as hedgingAnalyzed`);
@@ -1459,7 +1491,9 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                 matchTime: `${currentElapsed}'`,
                 status: matchStatus?.statusLong || 'En cours',
                 statistics: liveData?.statistics || null,
-                odds: liveData?.odds || null
+                odds: liveData?.odds || null,
+                preMatchOdds: liveData?.preMatchOdds || null,
+                oddsAvailable: !!(liveData?.odds?.length > 0 || liveData?.preMatchOdds)
             },
             hedgingAllowed: true,
             hedgingAnalyzed: true  // Indiquer que l'analyse est faite
@@ -1679,78 +1713,155 @@ app.post('/api/hedging/break-even', authMiddleware, async (req, res) => {
         }
 
         // ========== RÉCUPÉRER LES COTES LIVE ==========
-        let liveOdds = null;
+        let liveOdds = {};
         let matchStatus = null;
+        let oddsSource = "fallback";
         
         if (liveFootballService && fixtureId) {
             try {
                 // Récupérer le statut du match
                 matchStatus = await liveFootballService.getMatchStatus(parseInt(fixtureId));
                 
-                // Récupérer les cotes live
+                // Essayer les cotes live d'abord
                 const liveData = await liveFootballService.getFullLiveData(parseInt(fixtureId));
                 
-                if (liveData?.odds) {
-                    // Parser les cotes live
-                    liveOdds = {};
-                    const bookmakerOdds = liveData.odds[0]?.bookmakers?.[0]?.bets || [];
+                // Parser les cotes live (format: bookmakers: { "Bet365": { "Home": 1.5, ... } })
+                if (liveData?.odds && liveData.odds.length > 0) {
+                    const firstOdds = liveData.odds[0];
+                    const bookmakers = firstOdds?.bookmakers || {};
+                    const firstBookmaker = Object.values(bookmakers)[0] || {};
                     
-                    bookmakerOdds.forEach(bet => {
-                        const betName = bet.name?.toLowerCase() || '';
+                    if (Object.keys(firstBookmaker).length > 0) {
+                        oddsSource = "live";
+                        console.log("📊 Using live odds from:", Object.keys(bookmakers)[0]);
                         
-                        // Goals Over/Under
-                        if (betName.includes('over') || betName.includes('under') || betName.includes('goals')) {
-                            liveOdds.goals = liveOdds.goals || {};
-                            bet.values?.forEach(v => {
-                                if (v.value?.toLowerCase().includes('over')) {
-                                    const line = v.value.match(/[\d.]+/)?.[0] || '2.5';
-                                    liveOdds.goals.over = liveOdds.goals.over || {};
-                                    liveOdds.goals.over[line] = parseFloat(v.odd);
-                                } else if (v.value?.toLowerCase().includes('under')) {
-                                    const line = v.value.match(/[\d.]+/)?.[0] || '2.5';
-                                    liveOdds.goals.under = liveOdds.goals.under || {};
-                                    liveOdds.goals.under[line] = parseFloat(v.odd);
-                                }
-                            });
+                        // Parser les valeurs
+                        Object.entries(firstBookmaker).forEach(([key, value]) => {
+                            const keyLower = key.toLowerCase();
+                            
+                            // Over/Under
+                            if (keyLower.includes('over')) {
+                                const line = keyLower.match(/[\d.]+/)?.[0] || '2.5';
+                                liveOdds.goals = liveOdds.goals || {};
+                                liveOdds.goals.over = liveOdds.goals.over || {};
+                                liveOdds.goals.over[line] = parseFloat(value);
+                            } else if (keyLower.includes('under')) {
+                                const line = keyLower.match(/[\d.]+/)?.[0] || '2.5';
+                                liveOdds.goals = liveOdds.goals || {};
+                                liveOdds.goals.under = liveOdds.goals.under || {};
+                                liveOdds.goals.under[line] = parseFloat(value);
+                            }
+                            // BTTS
+                            else if (keyLower === 'yes' || keyLower === 'btts yes') {
+                                liveOdds.bttsYes = parseFloat(value);
+                            } else if (keyLower === 'no' || keyLower === 'btts no') {
+                                liveOdds.bttsNo = parseFloat(value);
+                            }
+                            // 1X2
+                            else if (keyLower === 'home') {
+                                liveOdds.home = parseFloat(value);
+                            } else if (keyLower === 'draw') {
+                                liveOdds.draw = parseFloat(value);
+                            } else if (keyLower === 'away') {
+                                liveOdds.away = parseFloat(value);
+                            }
+                            // Double Chance
+                            else if (keyLower === 'home/draw' || keyLower === '1x') {
+                                liveOdds.doubleChance = liveOdds.doubleChance || {};
+                                liveOdds.doubleChance['1X'] = parseFloat(value);
+                            } else if (keyLower === 'draw/away' || keyLower === 'x2') {
+                                liveOdds.doubleChance = liveOdds.doubleChance || {};
+                                liveOdds.doubleChance['X2'] = parseFloat(value);
+                            } else if (keyLower === 'home/away' || keyLower === '12') {
+                                liveOdds.doubleChance = liveOdds.doubleChance || {};
+                                liveOdds.doubleChance['12'] = parseFloat(value);
+                            }
+                        });
+                    }
+                }
+                
+                // Si pas de cotes live, essayer les cotes pré-match
+                if (Object.keys(liveOdds).length === 0) {
+                    console.log("⚠️ No live odds, trying pre-match odds...");
+                    const preMatchOdds = await liveFootballService.getPreMatchOdds(parseInt(fixtureId));
+                    
+                    if (preMatchOdds) {
+                        const bookmakerNames = Object.keys(preMatchOdds);
+                        if (bookmakerNames.length > 0) {
+                            const bm = preMatchOdds[bookmakerNames[0]];
+                            oddsSource = "pre-match";
+                            
+                            // Goals Over/Under
+                            if (bm['Goals Over/Under']) {
+                                liveOdds.goals = { over: {}, under: {} };
+                                Object.entries(bm['Goals Over/Under']).forEach(([key, val]) => {
+                                    if (key.toLowerCase().includes('over')) {
+                                        const line = key.match(/[\d.]+/)?.[0] || '2.5';
+                                        liveOdds.goals.over[line] = parseFloat(val);
+                                    } else if (key.toLowerCase().includes('under')) {
+                                        const line = key.match(/[\d.]+/)?.[0] || '2.5';
+                                        liveOdds.goals.under[line] = parseFloat(val);
+                                    }
+                                });
+                            }
+                            
+                            // BTTS
+                            if (bm['Both Teams Score']) {
+                                liveOdds.bttsYes = parseFloat(bm['Both Teams Score']['Yes']) || 1.8;
+                                liveOdds.bttsNo = parseFloat(bm['Both Teams Score']['No']) || 2.0;
+                            }
+                            
+                            // 1X2
+                            if (bm['Match Winner']) {
+                                liveOdds.home = parseFloat(bm['Match Winner']['Home']) || 2.0;
+                                liveOdds.draw = parseFloat(bm['Match Winner']['Draw']) || 3.5;
+                                liveOdds.away = parseFloat(bm['Match Winner']['Away']) || 3.0;
+                            }
+                            
+                            // Double Chance
+                            if (bm['Double Chance']) {
+                                liveOdds.doubleChance = {
+                                    '1X': parseFloat(bm['Double Chance']['Home/Draw']) || 1.3,
+                                    'X2': parseFloat(bm['Double Chance']['Draw/Away']) || 1.5,
+                                    '12': parseFloat(bm['Double Chance']['Home/Away']) || 1.4
+                                };
+                            }
                         }
-                        
-                        // BTTS
-                        if (betName.includes('both') || betName.includes('btts')) {
-                            bet.values?.forEach(v => {
-                                if (v.value?.toLowerCase() === 'yes') {
-                                    liveOdds.bttsYes = parseFloat(v.odd);
-                                } else if (v.value?.toLowerCase() === 'no') {
-                                    liveOdds.bttsNo = parseFloat(v.odd);
-                                }
-                            });
-                        }
-                        
-                        // Match Winner (1X2)
-                        if (betName.includes('winner') || betName === 'match winner') {
-                            bet.values?.forEach(v => {
-                                if (v.value === 'Home') liveOdds.home = parseFloat(v.odd);
-                                else if (v.value === 'Draw') liveOdds.draw = parseFloat(v.odd);
-                                else if (v.value === 'Away') liveOdds.away = parseFloat(v.odd);
-                            });
-                        }
-                        
-                        // Double Chance
-                        if (betName.includes('double chance')) {
-                            liveOdds.doubleChance = liveOdds.doubleChance || {};
-                            bet.values?.forEach(v => {
-                                if (v.value === 'Home/Draw' || v.value === '1X') liveOdds.doubleChance['1X'] = parseFloat(v.odd);
-                                else if (v.value === 'Home/Away' || v.value === '12') liveOdds.doubleChance['12'] = parseFloat(v.odd);
-                                else if (v.value === 'Draw/Away' || v.value === 'X2') liveOdds.doubleChance['X2'] = parseFloat(v.odd);
-                            });
+                    }
+                }
+                
+                console.log(`📊 Odds retrieved (${oddsSource}):`, liveOdds);
+                
+            } catch (error) {
+                console.warn("⚠️ Could not fetch odds:", error.message);
+            }
+        }
+        
+        // Si toujours pas de cotes, utiliser celles stockées dans la prédiction
+        if (Object.keys(liveOdds).length === 0 && prediction.hedgingLiveData?.preMatchOdds) {
+            const storedOdds = prediction.hedgingLiveData.preMatchOdds;
+            const bookmakerNames = Object.keys(storedOdds);
+            if (bookmakerNames.length > 0) {
+                const bm = storedOdds[bookmakerNames[0]];
+                oddsSource = "stored";
+                
+                // Parser les cotes stockées (même format que pré-match)
+                if (bm['Goals Over/Under']) {
+                    liveOdds.goals = { over: {}, under: {} };
+                    Object.entries(bm['Goals Over/Under']).forEach(([key, val]) => {
+                        if (key.toLowerCase().includes('over')) {
+                            liveOdds.goals.over[key.match(/[\d.]+/)?.[0] || '2.5'] = parseFloat(val);
+                        } else if (key.toLowerCase().includes('under')) {
+                            liveOdds.goals.under[key.match(/[\d.]+/)?.[0] || '2.5'] = parseFloat(val);
                         }
                     });
                 }
-                
-                console.log("📊 Live odds retrieved:", liveOdds);
-                
-            } catch (error) {
-                console.warn("⚠️ Could not fetch live odds:", error.message);
+                if (bm['Both Teams Score']) {
+                    liveOdds.bttsYes = parseFloat(bm['Both Teams Score']['Yes']) || 1.8;
+                    liveOdds.bttsNo = parseFloat(bm['Both Teams Score']['No']) || 2.0;
+                }
             }
+            console.log(`📊 Using stored odds:`, liveOdds);
         }
 
         // ========== CALCULER LES MISES DE COUVERTURE ==========
@@ -1870,7 +1981,8 @@ app.post('/api/hedging/break-even', authMiddleware, async (req, res) => {
                 totalAtRisk: totalInvested + totalHedgeRequired,
                 worstCaseWithHedge: isFinite(worstCaseWithHedge) ? worstCaseWithHedge : 0,
                 bestCaseWithHedge: isFinite(bestCaseWithHedge) ? bestCaseWithHedge : 0,
-                liveOddsAvailable: !!liveOdds
+                liveOddsAvailable: Object.keys(liveOdds).length > 0,
+                oddsSource: oddsSource
             },
             matchStatus: matchStatus ? {
                 score: matchStatus.score,
