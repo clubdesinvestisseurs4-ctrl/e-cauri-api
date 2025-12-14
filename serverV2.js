@@ -1003,27 +1003,47 @@ app.get('/api/predictions', authMiddleware, async (req, res) => {
         if (firestoreService) {
             let predictions = await firestoreService.getUserPredictions(req.user.uid, status);
             
-            // Dédupliquer par ID
-            const seen = new Map();
+            // Dédupliquer par MATCH (pas seulement par ID)
+            // Garder la prédiction avec selectedOptions validées
+            const matchMap = new Map();
+            
             predictions.forEach(pred => {
-                const id = pred.id;
-                // Garder la version la plus récente (avec selectedOptions si possible)
-                if (!seen.has(id)) {
-                    seen.set(id, pred);
+                // Créer une clé unique pour le match
+                const homeTeam = pred.matchInfo?.homeTeam || pred.meta?.homeTeam || '';
+                const awayTeam = pred.matchInfo?.awayTeam || pred.meta?.awayTeam || '';
+                const fixtureId = pred.matchInfo?.fixtureId || pred.meta?.matchId || pred.opportunityId || '';
+                
+                // Clé unique: fixtureId si disponible, sinon homeTeam vs awayTeam
+                const matchKey = fixtureId ? `fixture_${fixtureId}` : `${homeTeam}_vs_${awayTeam}`.toLowerCase();
+                
+                if (!matchMap.has(matchKey)) {
+                    matchMap.set(matchKey, pred);
                 } else {
-                    const existing = seen.get(id);
-                    // Préférer celle avec selectedOptions
-                    if (pred.selectedOptions?.length > 0 && !existing.selectedOptions?.length) {
-                        seen.set(id, pred);
+                    const existing = matchMap.get(matchKey);
+                    
+                    // Priorité: celle avec selectedOptions validées
+                    const existingHasOptions = existing.selectedOptions?.length > 0;
+                    const newHasOptions = pred.selectedOptions?.length > 0;
+                    
+                    if (newHasOptions && !existingHasOptions) {
+                        matchMap.set(matchKey, pred);
                     }
-                    // Ou celle avec le statut le plus avancé
-                    else if (pred.validatedAt && !existing.validatedAt) {
-                        seen.set(id, pred);
+                    else if (newHasOptions && existingHasOptions && pred.selectedOptions.length > existing.selectedOptions.length) {
+                        matchMap.set(matchKey, pred);
+                    }
+                    else if (!newHasOptions && !existingHasOptions) {
+                        // Garder celle avec le statut le plus avancé ou la plus récente
+                        if (pred.validatedAt && !existing.validatedAt) {
+                            matchMap.set(matchKey, pred);
+                        } else if (pred.status === 'active' && existing.status !== 'active') {
+                            matchMap.set(matchKey, pred);
+                        }
                     }
                 }
             });
             
-            predictions = Array.from(seen.values());
+            predictions = Array.from(matchMap.values());
+            console.log(`📋 Deduplicated predictions: ${matchMap.size} unique matches`);
             
             // Vérifier le statut live des matchs via API-Football si disponible
             if (liveFootballService && !includeFinished) {
