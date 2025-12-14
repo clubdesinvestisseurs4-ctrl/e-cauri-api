@@ -197,7 +197,7 @@ class FirestoreService {
             // Récupérer tous les documents de la collection
             const snapshot = await this.db.collection('opportunities')
                 .orderBy('scannedAt', 'desc')
-                .limit(50)
+                .limit(100)
                 .get();
 
             if (snapshot.empty) {
@@ -213,17 +213,53 @@ class FirestoreService {
                 return normalized;
             });
 
-            // Filtrer les matchs à venir (date dans le futur)
+            // Filtrer les matchs terminés et passés
             const now = new Date();
+            const threeHoursAgo = new Date(now.getTime() - 3 * 60 * 60 * 1000); // 3h avant maintenant
+            
+            // Statuts indiquant un match terminé
+            const finishedStatuses = ['FT', 'AET', 'PEN', 'CANC', 'ABD', 'AWD', 'WO', 'PST', 'INT', 'finished', 'ended', 'terminated'];
+            
             const upcoming = opportunities.filter(opp => {
-                if (!opp.matchDate) return true; // Garder si pas de date
-                const matchDate = new Date(opp.matchDate);
-                return matchDate > now;
+                // Vérifier le statut du match (plusieurs sources possibles)
+                const matchStatus = (
+                    opp.status || 
+                    opp._raw?.STATUS_MATCH?.short || 
+                    opp._raw?.STATUS_MATCH?.long ||
+                    opp._raw?.fixture?.status?.short ||
+                    ''
+                ).toUpperCase();
+                
+                // Exclure les matchs avec statut terminé
+                if (finishedStatuses.some(s => matchStatus.includes(s.toUpperCase()))) {
+                    console.log(`   ⏭️ Skipping finished match: ${opp.homeTeam} vs ${opp.awayTeam} (status: ${matchStatus})`);
+                    return false;
+                }
+                
+                // Vérifier la date du match
+                if (opp.matchDate) {
+                    const matchDate = new Date(opp.matchDate);
+                    
+                    // Exclure si le match a commencé il y a plus de 3h (probablement terminé)
+                    if (matchDate < threeHoursAgo) {
+                        console.log(`   ⏭️ Skipping old match: ${opp.homeTeam} vs ${opp.awayTeam} (date: ${matchDate.toISOString()})`);
+                        return false;
+                    }
+                }
+                
+                return true;
             });
 
-            console.log(`📅 ${upcoming.length} upcoming matches (filtered from ${opportunities.length})`);
+            console.log(`📅 ${upcoming.length} upcoming/live matches (filtered from ${opportunities.length})`);
             
-            return upcoming.length > 0 ? upcoming : opportunities;
+            // Trier par date (les plus proches en premier)
+            upcoming.sort((a, b) => {
+                const dateA = a.matchDate ? new Date(a.matchDate) : new Date(9999, 11, 31);
+                const dateB = b.matchDate ? new Date(b.matchDate) : new Date(9999, 11, 31);
+                return dateA - dateB;
+            });
+            
+            return upcoming;
 
         } catch (error) {
             console.error('❌ Error fetching opportunities:', error.message);
