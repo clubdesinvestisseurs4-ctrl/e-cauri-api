@@ -885,6 +885,172 @@ class FirestoreService {
         if (lowerName.includes('double chance') || lowerName.includes('1x') || lowerName.includes('x2')) return 'DOUBLE_CHANCE';
         return 'OTHER';
     }
+
+    // ============== GESTION DES ENTRÉES DE SOLDE (BALANCE ENTRIES) ==============
+
+    /**
+     * Récupère le dernier solde enregistré pour un utilisateur
+     */
+    async getLastBalance(userId) {
+        try {
+            const snapshot = await this.db.collection('balance_entries')
+                .where('userId', '==', userId)
+                .orderBy('timestamp', 'desc')
+                .limit(1)
+                .get();
+
+            if (snapshot.empty) {
+                return null;
+            }
+
+            const entry = snapshot.docs[0].data();
+            return {
+                id: snapshot.docs[0].id,
+                ...entry,
+                balance: entry.newBalance
+            };
+        } catch (error) {
+            console.error("Error getting last balance:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Ajoute une nouvelle entrée de solde
+     */
+    async addBalanceEntry(userId, newBalance, motif, description = '') {
+        try {
+            // Récupérer le dernier solde
+            const lastEntry = await this.getLastBalance(userId);
+            const oldBalance = lastEntry ? lastEntry.newBalance : 0;
+            const difference = newBalance - oldBalance;
+
+            // Créer l'entrée
+            const entry = {
+                userId,
+                timestamp: admin.firestore.FieldValue.serverTimestamp(),
+                oldBalance,
+                newBalance,
+                difference,
+                motif, // "Dépôt", "Retrait", "Bénéfice", "Perte"
+                description: description || '',
+                createdAt: new Date().toISOString()
+            };
+
+            const docRef = await this.db.collection('balance_entries').add(entry);
+
+            // Mettre à jour le currentBalance de l'utilisateur
+            await this.updateUserBalance(userId, newBalance);
+
+            console.log(`✅ Balance entry added: ${oldBalance} → ${newBalance} (${difference >= 0 ? '+' : ''}${difference})`);
+
+            return {
+                id: docRef.id,
+                ...entry,
+                timestamp: new Date() // Pour le retour immédiat
+            };
+        } catch (error) {
+            console.error("Error adding balance entry:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Met à jour le currentBalance d'un utilisateur
+     */
+    async updateUserBalance(userId, newBalance) {
+        try {
+            const userRef = this.db.collection('users').doc(userId);
+            await userRef.set({
+                currentBalance: newBalance,
+                lastBalanceUpdate: admin.firestore.FieldValue.serverTimestamp()
+            }, { merge: true });
+        } catch (error) {
+            console.error("Error updating user balance:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Récupère l'historique des entrées de solde
+     */
+    async getBalanceHistory(userId, limit = 50) {
+        try {
+            const snapshot = await this.db.collection('balance_entries')
+                .where('userId', '==', userId)
+                .orderBy('timestamp', 'desc')
+                .limit(limit)
+                .get();
+
+            const entries = [];
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                entries.push({
+                    id: doc.id,
+                    ...data,
+                    timestamp: data.timestamp?.toDate?.() || new Date(data.createdAt)
+                });
+            });
+
+            return entries;
+        } catch (error) {
+            console.error("Error getting balance history:", error);
+            throw error;
+        }
+    }
+
+    /**
+     * Calcule les statistiques du capital
+     */
+    async getCapitalStats(userId) {
+        try {
+            const entries = await this.getBalanceHistory(userId, 1000);
+
+            if (entries.length === 0) {
+                return {
+                    currentBalance: 0,
+                    totalGains: 0,
+                    totalLosses: 0,
+                    netProfit: 0,
+                    totalDeposits: 0,
+                    totalWithdrawals: 0,
+                    entriesCount: 0
+                };
+            }
+
+            // Calculer les totaux par motif
+            const stats = {
+                currentBalance: entries[0].newBalance,
+                totalGains: 0,
+                totalLosses: 0,
+                totalDeposits: 0,
+                totalWithdrawals: 0,
+                entriesCount: entries.length
+            };
+
+            entries.forEach(entry => {
+                const diff = entry.difference || 0;
+                const motif = entry.motif?.toLowerCase() || '';
+
+                if (motif === 'bénéfice') {
+                    stats.totalGains += Math.abs(diff);
+                } else if (motif === 'perte') {
+                    stats.totalLosses += Math.abs(diff);
+                } else if (motif === 'dépôt') {
+                    stats.totalDeposits += Math.abs(diff);
+                } else if (motif === 'retrait') {
+                    stats.totalWithdrawals += Math.abs(diff);
+                }
+            });
+
+            stats.netProfit = stats.totalGains - stats.totalLosses;
+
+            return stats;
+        } catch (error) {
+            console.error("Error getting capital stats:", error);
+            throw error;
+        }
+    }
 }
 
 // ============== EXPORTS ==============

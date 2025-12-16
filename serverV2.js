@@ -3514,6 +3514,211 @@ app.post('/api/user/capital/adjust', authMiddleware, async (req, res) => {
     }
 });
 
+// ============== ROUTES - BALANCE ENTRIES (Nouveau système de suivi du capital) ==============
+
+/**
+ * POST /api/balance-entries/add
+ * Ajoute une nouvelle entrée de solde avec motif
+ */
+app.post('/api/balance-entries/add', authMiddleware, async (req, res) => {
+    try {
+        const { newBalance, motif, description } = req.body;
+
+        if (!newBalance || !motif) {
+            return res.status(400).json({ error: "newBalance et motif sont requis" });
+        }
+
+        // Valider le motif
+        const validMotifs = ['Dépôt', 'Retrait', 'Bénéfice', 'Perte'];
+        if (!validMotifs.includes(motif)) {
+            return res.status(400).json({ error: "Motif invalide. Utilisez: Dépôt, Retrait, Bénéfice ou Perte" });
+        }
+
+        // Valider que le montant est positif
+        if (newBalance < 0) {
+            return res.status(400).json({ error: "Le solde ne peut pas être négatif" });
+        }
+
+        if (!firestoreService) {
+            return res.json({
+                success: true,
+                entry: {
+                    id: 'demo_' + Date.now(),
+                    oldBalance: 50000,
+                    newBalance: parseFloat(newBalance),
+                    difference: parseFloat(newBalance) - 50000,
+                    motif,
+                    description: description || '',
+                    timestamp: new Date()
+                },
+                message: "Mode démo - entrée simulée"
+            });
+        }
+
+        // Ajouter l'entrée
+        const entry = await firestoreService.addBalanceEntry(
+            req.user.uid,
+            parseFloat(newBalance),
+            motif,
+            description || ''
+        );
+
+        // Log de l'action
+        await firestoreService.logUserAction(req.user.uid, 'balance_entry_added', {
+            newBalance: parseFloat(newBalance),
+            motif,
+            difference: entry.difference
+        });
+
+        console.log(`✅ Balance entry added for user ${req.user.uid}: ${entry.oldBalance} → ${entry.newBalance} (${motif})`);
+
+        res.json({
+            success: true,
+            entry: {
+                id: entry.id,
+                oldBalance: entry.oldBalance,
+                newBalance: entry.newBalance,
+                difference: entry.difference,
+                motif: entry.motif,
+                description: entry.description,
+                timestamp: entry.timestamp
+            }
+        });
+
+    } catch (error) {
+        console.error("Error adding balance entry:", error);
+        res.status(500).json({ error: "Erreur lors de l'ajout de l'entrée" });
+    }
+});
+
+/**
+ * GET /api/balance-entries/history
+ * Récupère l'historique des entrées de solde
+ */
+app.get('/api/balance-entries/history', authMiddleware, async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+
+        if (!firestoreService) {
+            // Mode démo
+            return res.json({
+                entries: [
+                    {
+                        id: 'demo_1',
+                        oldBalance: 40000,
+                        newBalance: 50000,
+                        difference: 10000,
+                        motif: 'Dépôt',
+                        description: 'Dépôt initial',
+                        timestamp: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+                    },
+                    {
+                        id: 'demo_2',
+                        oldBalance: 50000,
+                        newBalance: 52000,
+                        difference: 2000,
+                        motif: 'Bénéfice',
+                        description: 'Gain sur pari',
+                        timestamp: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000)
+                    },
+                    {
+                        id: 'demo_3',
+                        oldBalance: 52000,
+                        newBalance: 51000,
+                        difference: -1000,
+                        motif: 'Perte',
+                        description: 'Perte sur pari',
+                        timestamp: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
+                    }
+                ]
+            });
+        }
+
+        const entries = await firestoreService.getBalanceHistory(req.user.uid, limit);
+
+        res.json({ entries });
+
+    } catch (error) {
+        console.error("Error getting balance history:", error);
+        res.status(500).json({ error: "Erreur lors de la récupération de l'historique" });
+    }
+});
+
+/**
+ * GET /api/balance-entries/stats
+ * Récupère les statistiques du capital
+ */
+app.get('/api/balance-entries/stats', authMiddleware, async (req, res) => {
+    try {
+        if (!firestoreService) {
+            // Mode démo
+            return res.json({
+                stats: {
+                    currentBalance: 51000,
+                    totalGains: 2000,
+                    totalLosses: 1000,
+                    netProfit: 1000,
+                    totalDeposits: 10000,
+                    totalWithdrawals: 0,
+                    entriesCount: 3
+                }
+            });
+        }
+
+        const stats = await firestoreService.getCapitalStats(req.user.uid);
+
+        res.json({ stats });
+
+    } catch (error) {
+        console.error("Error getting capital stats:", error);
+        res.status(500).json({ error: "Erreur lors de la récupération des statistiques" });
+    }
+});
+
+/**
+ * GET /api/balance-entries/last
+ * Récupère le dernier solde enregistré
+ */
+app.get('/api/balance-entries/last', authMiddleware, async (req, res) => {
+    try {
+        if (!firestoreService) {
+            // Mode démo
+            return res.json({
+                lastBalance: {
+                    id: 'demo_last',
+                    balance: 51000,
+                    newBalance: 51000,
+                    motif: 'Perte',
+                    timestamp: new Date()
+                }
+            });
+        }
+
+        const lastEntry = await firestoreService.getLastBalance(req.user.uid);
+
+        if (!lastEntry) {
+            return res.json({
+                lastBalance: null,
+                message: "Aucune entrée trouvée. Ajoutez votre premier solde."
+            });
+        }
+
+        res.json({
+            lastBalance: {
+                id: lastEntry.id,
+                balance: lastEntry.newBalance,
+                newBalance: lastEntry.newBalance,
+                motif: lastEntry.motif,
+                timestamp: lastEntry.timestamp
+            }
+        });
+
+    } catch (error) {
+        console.error("Error getting last balance:", error);
+        res.status(500).json({ error: "Erreur lors de la récupération du dernier solde" });
+    }
+});
+
 // ============== ROUTES - USER ==============
 
 /**
