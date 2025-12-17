@@ -3719,6 +3719,118 @@ app.get('/api/balance-entries/last', authMiddleware, async (req, res) => {
     }
 });
 
+/**
+ * POST /api/capital/recommendations
+ * Génère des recommandations personnalisées basées sur l'historique du capital
+ */
+app.post('/api/capital/recommendations', authMiddleware, async (req, res) => {
+    try {
+        const { stats, history } = req.body;
+
+        if (!stats) {
+            return res.status(400).json({ error: "Stats are required" });
+        }
+
+        // Préparer le prompt pour DeepSeek
+        const prompt = `Tu es un expert en gestion de bankroll pour les paris sportifs. Analyse les données suivantes et donne des recommandations personnalisées.
+
+## STATISTIQUES DU CAPITAL
+- Solde actuel: ${stats.currentBalance || 0} FCFA
+- Gains totaux: ${stats.totalGains || 0} FCFA
+- Pertes totales: ${stats.totalLosses || 0} FCFA
+- Profit net: ${stats.netProfit || 0} FCFA
+- Total des dépôts: ${stats.totalDeposits || 0} FCFA
+- Total des retraits: ${stats.totalWithdrawals || 0} FCFA
+- Nombre d'entrées: ${stats.entriesCount || 0}
+
+## HISTORIQUE RÉCENT (${history?.length || 0} dernières entrées)
+${history?.slice(0, 10).map((h, i) => `${i+1}. ${h.motif}: ${h.difference >= 0 ? '+' : ''}${h.difference} FCFA (${new Date(h.timestamp).toLocaleDateString('fr-FR')})`).join('\n') || 'Aucun historique'}
+
+## INSTRUCTIONS
+1. Analyse la santé financière du capital
+2. Identifie les patterns (gains/pertes fréquents, tendances)
+3. Donne 3-5 recommandations concrètes et actionnables
+4. Calcule la mise maximale recommandée (5% du capital)
+5. Évalue le niveau de risque (low, medium, high)
+
+Réponds en JSON:
+{
+    "analysis": "Ton analyse détaillée en français avec des emojis...",
+    "riskLevel": "low|medium|high",
+    "suggestedMaxBet": number,
+    "tips": ["conseil1", "conseil2", "conseil3"]
+}`;
+
+        // Essayer d'utiliser DeepSeek
+        if (predictionService && predictionService.deepseekKey) {
+            try {
+                console.log("🧠 Generating capital recommendations with DeepSeek...");
+                
+                const result = await callDeepSeek(
+                    prompt,
+                    predictionService.deepseekKey,
+                    "Tu es un expert en gestion de bankroll et paris sportifs. Tu donnes des conseils précis et personnalisés.",
+                    true
+                );
+                
+                console.log("✅ DeepSeek recommendations generated");
+                
+                // Log de l'action
+                if (firestoreService) {
+                    await firestoreService.logUserAction(req.user.uid, 'capital_recommendations', {
+                        currentBalance: stats.currentBalance,
+                        netProfit: stats.netProfit
+                    });
+                }
+                
+                return res.json({ recommendations: result });
+                
+            } catch (deepseekError) {
+                console.warn("⚠️ DeepSeek error:", deepseekError.message);
+            }
+        }
+
+        // Fallback - Recommandations calculées localement
+        const currentBalance = stats.currentBalance || 0;
+        const netProfit = stats.netProfit || 0;
+        const winRate = stats.totalGains > 0 && stats.totalLosses > 0 
+            ? (stats.totalGains / (stats.totalGains + stats.totalLosses)) * 100 
+            : 50;
+        
+        let riskLevel = 'medium';
+        let analysis = '';
+        
+        if (netProfit > 0 && winRate > 55) {
+            riskLevel = 'low';
+            analysis = `📊 **Excellente gestion du capital!**\n\nVotre solde actuel de ${currentBalance.toLocaleString()} FCFA montre une progression positive avec un profit net de +${netProfit.toLocaleString()} FCFA.\n\n✅ **Points forts:**\n- Taux de réussite estimé: ~${winRate.toFixed(0)}%\n- Bonne discipline de mise\n- Capital en croissance\n\n💡 **Recommandations:**\n- Continuez avec votre stratégie actuelle\n- Mise max recommandée: ${Math.round(currentBalance * 0.05).toLocaleString()} FCFA (5%)\n- Pensez à sécuriser une partie de vos gains par un retrait`;
+        } else if (netProfit < 0) {
+            riskLevel = 'high';
+            analysis = `⚠️ **Attention - Capital en baisse**\n\nVotre solde de ${currentBalance.toLocaleString()} FCFA montre une perte nette de ${netProfit.toLocaleString()} FCFA.\n\n🔴 **Points d'attention:**\n- Pertes supérieures aux gains\n- Risque de diminution du capital\n\n💡 **Recommandations urgentes:**\n- Réduisez vos mises à 2-3% du capital\n- Mise max: ${Math.round(currentBalance * 0.03).toLocaleString()} FCFA\n- Évitez de "chasser" vos pertes\n- Faites une pause si nécessaire\n- Analysez vos paris perdants pour identifier les erreurs`;
+        } else {
+            analysis = `📊 **Analyse de votre capital**\n\nVotre solde actuel est de ${currentBalance.toLocaleString()} FCFA avec un profit net de ${netProfit.toLocaleString()} FCFA.\n\n📈 **Situation:**\n- Capital stable\n- Marge de progression possible\n\n💡 **Recommandations:**\n- Mise max recommandée: ${Math.round(currentBalance * 0.05).toLocaleString()} FCFA (5%)\n- Diversifiez vos paris\n- Tenez un journal de vos paris\n- Fixez-vous des objectifs réalistes`;
+        }
+        
+        const recommendations = {
+            analysis,
+            riskLevel,
+            suggestedMaxBet: Math.round(currentBalance * (riskLevel === 'high' ? 0.03 : 0.05)),
+            tips: [
+                "Ne misez jamais plus de 5% de votre capital sur un seul pari",
+                "Évitez les paris émotionnels après une perte",
+                "Tenez un historique détaillé de tous vos paris",
+                "Fixez-vous un objectif de profit quotidien/hebdomadaire",
+                "Faites des pauses régulières pour garder la tête froide"
+            ]
+        };
+
+        res.json({ recommendations });
+
+    } catch (error) {
+        console.error("Error generating recommendations:", error);
+        res.status(500).json({ error: "Erreur lors de la génération des recommandations" });
+    }
+});
+
 // ============== ROUTES - USER ==============
 
 /**
