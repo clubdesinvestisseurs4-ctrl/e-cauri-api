@@ -586,21 +586,49 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
             const options = prediction.oddsAnalysis.recommendedOptions;
             const maxBudget = Math.round(userBalance * 0.06); // 6% du capital
             
-            // Calculer les stakes basées sur Kelly simplifié
+            // Calculer les stakes basées sur Kelly simplifié + EDGE
             const calculatedStakes = options.slice(0, 3).map((opt, index) => {
                 const prob = opt.estimatedProbability || opt.probability || 0.5;
                 const odds = opt.odds || 1.5;
+                
+                // ========== CALCUL DE L'EDGE ==========
+                // EDGE = (Probabilité × Cote) - 1
+                const edge = (prob * odds) - 1;
+                const edgePercent = Math.round(edge * 1000) / 10;
+                
+                // Déterminer le niveau de risque basé sur l'EDGE
+                let riskLevel, dangerLevel;
+                if (edgePercent >= 6) {
+                    riskLevel = 'low';
+                    dangerLevel = 'excellent';
+                } else if (edgePercent >= 3) {
+                    riskLevel = 'low';
+                    dangerLevel = 'good';
+                } else if (edgePercent >= 0) {
+                    riskLevel = 'medium';
+                    dangerLevel = 'moderate';
+                } else if (edgePercent >= -6) {
+                    riskLevel = 'high';
+                    dangerLevel = 'no_value';
+                } else {
+                    riskLevel = 'very_high';
+                    dangerLevel = 'dangerous';
+                }
                 
                 // Kelly simplifié: f = (p * b - q) / b où p=prob, b=odds-1, q=1-p
                 const b = odds - 1;
                 const q = 1 - prob;
                 let kellyFraction = Math.max(0, (prob * b - q) / b);
                 
-                // Limiter à 5% max par pari
-                kellyFraction = Math.min(kellyFraction, 0.05);
+                // Limiter à 5% max par pari, réduire si pas de value
+                if (edgePercent < 0) {
+                    kellyFraction = 0; // Pas de mise recommandée si pas de value
+                } else {
+                    kellyFraction = Math.min(kellyFraction, 0.05);
+                }
                 
                 // Répartir le budget selon Kelly
-                const stake = Math.round(userBalance * kellyFraction) || Math.round(maxBudget / options.length);
+                const stake = Math.round(userBalance * kellyFraction) || (edgePercent >= 0 ? Math.round(maxBudget / options.length) : 0);
                 
                 return {
                     option: opt.option,
@@ -610,24 +638,37 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
                     potentialReturn: Math.round(stake * odds),
                     kellyPercentage: Math.round(kellyFraction * 100 * 10) / 10,
                     probability: prob,
-                    riskLevel: opt.riskLevel || 'medium'
+                    edge: edgePercent,
+                    edgeValue: edge,
+                    riskLevel: opt.riskLevel || riskLevel,
+                    dangerLevel: dangerLevel,
+                    isValueBet: edgePercent >= 0,
+                    reasoning: opt.reasoning || (edgePercent >= 6 
+                        ? `Excellente value (+${edgePercent}% EDGE)` 
+                        : edgePercent >= 0 
+                            ? `Value bet modéré (+${edgePercent}% EDGE)` 
+                            : `Pas de value (${edgePercent}% EDGE) - À éviter`)
                 };
             });
             
-            const totalStake = calculatedStakes.reduce((sum, s) => sum + s.stake, 0);
+            // Filtrer les options sans value pour le récap mais les garder pour affichage
+            const valueBets = calculatedStakes.filter(s => s.isValueBet);
+            const totalStake = valueBets.reduce((sum, s) => sum + s.stake, 0);
             
             prediction.stakes = {
                 totalBudget: totalStake,
                 totalStake: totalStake,
                 maxBudgetAllowed: maxBudget,
                 stakes: calculatedStakes,
+                valueBetsCount: valueBets.length,
+                totalOptions: calculatedStakes.length,
                 expectedValue: Math.round(totalStake * 0.12),
                 expectedROI: 12,
-                riskLevel: 'medium',
-                calculations: `Calculé automatiquement avec Kelly sur ${calculatedStakes.length} options`
+                riskLevel: valueBets.length === 0 ? 'high' : (valueBets.some(s => s.edge >= 6) ? 'low' : 'medium'),
+                calculations: `Calculé avec Kelly + EDGE sur ${calculatedStakes.length} options (${valueBets.length} value bets)`
             };
             
-            console.log(`✅ Stakes calculated:`, prediction.stakes.stakes.map(s => `${s.option}: ${s.stake} FCFA`));
+            console.log(`✅ Stakes calculated:`, prediction.stakes.stakes.map(s => `${s.option}: ${s.stake} FCFA (EDGE: ${s.edge}%)`));
         }
         // ================================================
 
