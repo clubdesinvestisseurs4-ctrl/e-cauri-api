@@ -509,16 +509,20 @@ function extractAvailableBookmakers(matchData) {
  */
 app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
     try {
-        const { opportunityId, userBalance, bookmaker } = req.body;
+        const { opportunityId, userBalance, bookmaker, stakePercentage = 6 } = req.body;
 
         if (!opportunityId || !userBalance) {
             return res.status(400).json({ error: "opportunityId and userBalance are required" });
         }
 
+        // Valider le pourcentage (entre 1 et 15)
+        const validatedPercentage = Math.max(1, Math.min(15, parseInt(stakePercentage) || 6));
+
         console.log(`\n🎯 Starting AI Analysis...`);
         console.log(`   Match ID: ${opportunityId}`);
         console.log(`   Capital: ${userBalance} FCFA`);
         console.log(`   Bookmaker: ${bookmaker || 'default'}`);
+        console.log(`   Stake %: ${validatedPercentage}%`);
 
         // Log de l'action (avec try-catch pour éviter les erreurs)
         try {
@@ -526,7 +530,8 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
                 await firestoreService.logUserAction(req.user.uid, 'start_analysis', {
                     opportunityId,
                     userBalance,
-                    bookmaker
+                    bookmaker,
+                    stakePercentage: validatedPercentage
                 }, { opportunityId });
             }
         } catch (logError) {
@@ -581,54 +586,27 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
         // ========== CALCUL DES STAKES SI VIDES ==========
         // Si l'IA n'a pas généré de stakes, les calculer à partir des options recommandées
         if (!prediction.stakes?.stakes?.length && prediction.oddsAnalysis?.recommendedOptions?.length) {
-            console.log(`📊 Calculating stakes from recommended options...`);
+            console.log(`📊 Calculating stakes from recommended options (${validatedPercentage}% budget)...`);
             
             const options = prediction.oddsAnalysis.recommendedOptions;
-            const maxBudget = Math.round(userBalance * 0.06); // 6% du capital
+            const maxBudget = Math.round(userBalance * validatedPercentage / 100); // Utiliser le pourcentage choisi
+            const maxPerBet = validatedPercentage / 100; // Limite par pari
             
-            // Calculer les stakes basées sur Kelly simplifié + EDGE
+            // Calculer les stakes basées sur Kelly simplifié
             const calculatedStakes = options.slice(0, 3).map((opt, index) => {
                 const prob = opt.estimatedProbability || opt.probability || 0.5;
                 const odds = opt.odds || 1.5;
-                
-                // ========== CALCUL DE L'EDGE ==========
-                // EDGE = (Probabilité × Cote) - 1
-                const edge = (prob * odds) - 1;
-                const edgePercent = Math.round(edge * 1000) / 10;
-                
-                // Déterminer le niveau de risque basé sur l'EDGE
-                let riskLevel, dangerLevel;
-                if (edgePercent >= 6) {
-                    riskLevel = 'low';
-                    dangerLevel = 'excellent';
-                } else if (edgePercent >= 3) {
-                    riskLevel = 'low';
-                    dangerLevel = 'good';
-                } else if (edgePercent >= 0) {
-                    riskLevel = 'medium';
-                    dangerLevel = 'moderate';
-                } else if (edgePercent >= -6) {
-                    riskLevel = 'high';
-                    dangerLevel = 'no_value';
-                } else {
-                    riskLevel = 'very_high';
-                    dangerLevel = 'dangerous';
-                }
                 
                 // Kelly simplifié: f = (p * b - q) / b où p=prob, b=odds-1, q=1-p
                 const b = odds - 1;
                 const q = 1 - prob;
                 let kellyFraction = Math.max(0, (prob * b - q) / b);
                 
-                // Limiter à 5% max par pari, réduire si pas de value
-                if (edgePercent < 0) {
-                    kellyFraction = 0; // Pas de mise recommandée si pas de value
-                } else {
-                    kellyFraction = Math.min(kellyFraction, 0.05);
-                }
+                // Limiter au pourcentage max par pari
+                kellyFraction = Math.min(kellyFraction, maxPerBet);
                 
                 // Répartir le budget selon Kelly
-                const stake = Math.round(userBalance * kellyFraction) || (edgePercent >= 0 ? Math.round(maxBudget / options.length) : 0);
+                const stake = Math.round(userBalance * kellyFraction) || Math.round(maxBudget / options.length);
                 
                 return {
                     option: opt.option,
@@ -638,37 +616,24 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
                     potentialReturn: Math.round(stake * odds),
                     kellyPercentage: Math.round(kellyFraction * 100 * 10) / 10,
                     probability: prob,
-                    edge: edgePercent,
-                    edgeValue: edge,
-                    riskLevel: opt.riskLevel || riskLevel,
-                    dangerLevel: dangerLevel,
-                    isValueBet: edgePercent >= 0,
-                    reasoning: opt.reasoning || (edgePercent >= 6 
-                        ? `Excellente value (+${edgePercent}% EDGE)` 
-                        : edgePercent >= 0 
-                            ? `Value bet modéré (+${edgePercent}% EDGE)` 
-                            : `Pas de value (${edgePercent}% EDGE) - À éviter`)
+                    riskLevel: opt.riskLevel || 'medium'
                 };
             });
             
-            // Filtrer les options sans value pour le récap mais les garder pour affichage
-            const valueBets = calculatedStakes.filter(s => s.isValueBet);
-            const totalStake = valueBets.reduce((sum, s) => sum + s.stake, 0);
+            const totalStake = calculatedStakes.reduce((sum, s) => sum + s.stake, 0);
             
             prediction.stakes = {
                 totalBudget: totalStake,
                 totalStake: totalStake,
                 maxBudgetAllowed: maxBudget,
                 stakes: calculatedStakes,
-                valueBetsCount: valueBets.length,
-                totalOptions: calculatedStakes.length,
                 expectedValue: Math.round(totalStake * 0.12),
                 expectedROI: 12,
-                riskLevel: valueBets.length === 0 ? 'high' : (valueBets.some(s => s.edge >= 6) ? 'low' : 'medium'),
-                calculations: `Calculé avec Kelly + EDGE sur ${calculatedStakes.length} options (${valueBets.length} value bets)`
+                riskLevel: 'medium',
+                calculations: `Calculé automatiquement avec Kelly sur ${calculatedStakes.length} options`
             };
             
-            console.log(`✅ Stakes calculated:`, prediction.stakes.stakes.map(s => `${s.option}: ${s.stake} FCFA (EDGE: ${s.edge}%)`));
+            console.log(`✅ Stakes calculated:`, prediction.stakes.stakes.map(s => `${s.option}: ${s.stake} FCFA`));
         }
         // ================================================
 
@@ -1388,14 +1353,8 @@ app.post('/api/hedging/strategy', authMiddleware, async (req, res) => {
         // ========== CALCUL DE LA STRATÉGIE AVEC DEEPSEEK ==========
         let strategy;
         
-        // Calculer les données de base pour les stratégies
-        const totalInvested = optionsToAnalyze.reduce((sum, opt) => sum + (opt.stake || 0), 0);
-        const totalPotentialProfit = optionsToAnalyze.reduce((sum, opt) => sum + Math.round((opt.stake || 0) * ((opt.odds || 1.5) - 1)), 0);
-        const totalPotentialReturn = totalInvested + totalPotentialProfit;
-        const totalCashoutAvailable = Object.values(safeCashouts).reduce((sum, c) => sum + (parseFloat(c) || 0), 0);
-        
-        // Préparer le prompt pour DeepSeek Reasoner - MULTIPLE STRATÉGIES
-        const hedgingPrompt = `Tu es un expert en paris sportifs et stratégies de couverture (hedging). Analyse la situation et propose PLUSIEURS stratégies avec des calculs détaillés.
+        // Préparer le prompt pour DeepSeek Reasoner
+        const hedgingPrompt = `Tu es un expert en paris sportifs et stratégies de couverture (hedging). Analyse la situation suivante et recommande la meilleure stratégie.
 
 ## MATCH EN COURS
 - **${matchInfo.homeTeam || 'Équipe A'}** vs **${matchInfo.awayTeam || 'Équipe B'}**
@@ -1406,99 +1365,80 @@ app.post('/api/hedging/strategy', authMiddleware, async (req, res) => {
 ## MES PARIS EN COURS
 ${optionsToAnalyze.map((opt, i) => `
 ### Option ${i + 1}: ${opt.option}
-- Mise initiale: ${opt.stake || 0} FCFA
+- Mise: ${opt.stake || 0} FCFA
 - Cote initiale: ${opt.odds || 1.5}
-- Retour potentiel: ${Math.round((opt.stake || 0) * (opt.odds || 1.5))} FCFA
-- Profit potentiel: ${Math.round((opt.stake || 0) * ((opt.odds || 1.5) - 1))} FCFA
-- Cashout proposé: ${safeCashouts[`option_${i}`] || safeCashouts[opt.option] || 'Non disponible'}
+- Gain potentiel: ${Math.round((opt.stake || 0) * ((opt.odds || 1.5) - 1))} FCFA
+- Cashout proposé: ${safeCashouts[`option_${i}`] || safeCashouts[opt.option] || 'Non renseigné'}
 `).join('\n')}
-
-## TOTAUX
-- Total investi: ${totalInvested} FCFA
-- Profit potentiel total: ${totalPotentialProfit} FCFA
-- Retour potentiel total: ${totalPotentialReturn} FCFA
-- Cashout total disponible: ${totalCashoutAvailable || 'Non renseigné'} FCFA
 
 ## STATS LIVE
 ${liveData?.statistics ? JSON.stringify(LiveFootballService.formatLiveStatsForDisplay(liveData.statistics), null, 2) : 'Non disponibles'}
 
-## COTES DISPONIBLES POUR HEDGE
+## COTES DISPONIBLES
 ${oddsDescription}
 
-## INSTRUCTIONS IMPORTANTES
-Tu dois proposer EXACTEMENT 4 STRATÉGIES différentes avec pour chacune:
-1. Les calculs détaillés avec formules
-2. Les scénarios de profit/perte
-3. Le niveau de risque
-4. Les avantages et inconvénients
-
-Les 4 stratégies OBLIGATOIRES:
-1. **HOLD** - Garder tous les paris (risque max, profit max)
-2. **CASHOUT** - Encaisser maintenant (sécurité immédiate)
-3. **HEDGE_PARTIEL** - Couvrir partiellement pour réduire le risque
-4. **HEDGE_TOTAL** - Couvrir totalement pour garantir un profit
+## INSTRUCTIONS
+1. Analyse chaque option par rapport au score actuel et au temps restant
+2. Détermine si chaque pari est en bonne voie (winning), en difficulté (losing), ou incertain (pending)
+3. Recommande une action pour chaque option: HOLD (garder), CASHOUT (encaisser), HEDGE (couvrir)
+4. Si hedge recommandé, calcule précisément les mises nécessaires
+5. Calcule les scénarios de profit/perte
 
 Réponds UNIQUEMENT en JSON valide avec cette structure:
 {
-    "matchAnalysis": {
-        "currentSituation": "Description de la situation actuelle du match",
-        "trendsObserved": "Tendances observées (possession, tirs, momentum)",
-        "riskAssessment": "Évaluation du risque global"
+    "recommendation": "hold|cashout|hedge|monitor",
+    "confidence": 0.0,
+    "analysis": "Analyse détaillée de la situation...",
+    "currentStatus": {
+        "overall": "winning|losing|uncertain",
+        "scoreImpact": "Description de l'impact du score actuel"
     },
-    "optionsStatus": [
+    "options": [
         {
             "option": "Nom de l'option",
-            "status": "winning|losing|pending|won|lost",
-            "probability": 0.0,
-            "analysis": "Pourquoi ce statut"
+            "currentStatus": "winning|losing|pending|won|lost",
+            "recommendation": "hold|cashout|hedge",
+            "stake": 0,
+            "odds": 0.0,
+            "potentialProfit": 0,
+            "cashoutValue": 0,
+            "analysis": "Analyse spécifique pour cette option",
+            "hedgeDetails": {
+                "required": false,
+                "newBet": "",
+                "newOdds": 0.0,
+                "stakeRequired": 0,
+                "guaranteedProfit": 0
+            }
         }
     ],
-    "strategies": [
+    "scenarios": [
         {
-            "id": "hold",
-            "name": "🎯 MAINTENIR",
-            "description": "Garder tous les paris jusqu'à la fin",
-            "riskLevel": "high|medium|low",
-            "riskScore": 8,
-            "recommended": false,
-            "calculations": {
-                "formula": "Profit = Σ(Mise × Cote) - Total investi",
-                "details": [
-                    "Si tous gagnants: +X FCFA",
-                    "Si tous perdants: -Y FCFA"
-                ],
-                "expectedValue": 0,
-                "variance": 0
-            },
-            "scenarios": [
-                {
-                    "name": "Tous gagnants",
-                    "probability": 0.0,
-                    "profit": 0,
-                    "explanation": "Calcul détaillé..."
-                }
-            ],
-            "actions": [],
-            "pros": ["Avantage 1", "Avantage 2"],
-            "cons": ["Inconvénient 1", "Inconvénient 2"],
-            "summary": "Résumé de la stratégie"
+            "name": "Scénario 1",
+            "probability": 0.0,
+            "profitWithoutHedge": 0,
+            "profitWithHedge": 0
         }
     ],
-    "recommendedStrategy": "hold|cashout|hedge_partiel|hedge_total",
-    "confidence": 0.0,
-    "reasoning": "Explication du choix de la stratégie recommandée",
-    "summary": "Conseil final concis"
+    "calculations": {
+        "totalInvested": 0,
+        "totalCashoutAvailable": 0,
+        "bestCaseProfit": 0,
+        "worstCaseLoss": 0
+    },
+    "summary": "Conseil final clair et concis",
+    "isDemo": false
 }`;
 
         if (predictionService && predictionService.deepseekKey) {
             try {
-                console.log("🧠 Calculating hedging strategies with DeepSeek Reasoner...");
+                console.log("🧠 Calculating hedging strategy with DeepSeek Reasoner...");
                 
                 // Utiliser DeepSeek Reasoner
                 const deepseekResult = await callDeepSeek(
                     hedgingPrompt,
                     predictionService.deepseekKey,
-                    "Tu es un expert en paris sportifs spécialisé dans les stratégies de couverture (hedging). Tu calcules avec précision et tu proposes plusieurs options avec leurs calculs détaillés. Tu donnes des conseils clairs et actionnables.",
+                    "Tu es un expert en paris sportifs spécialisé dans les stratégies de couverture (hedging). Tu calcules avec précision et tu donnes des conseils clairs et actionnables.",
                     true  // Utiliser le mode Reasoner
                 );
                 
@@ -1507,16 +1447,16 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                 strategy.generatedAt = new Date().toISOString();
                 strategy.engine = "deepseek-reasoner";
                 
-                console.log("✅ DeepSeek strategies calculated successfully");
+                console.log("✅ DeepSeek strategy calculated successfully");
                 
             } catch (deepseekError) {
-                console.warn("⚠️ DeepSeek error, falling back to calculated strategies:", deepseekError.message);
-                strategy = generateCalculatedHedgingStrategies(optionsToAnalyze, currentScore, currentElapsed, safeCashouts, liveData, matchInfo);
+                console.warn("⚠️ DeepSeek error, falling back to mock:", deepseekError.message);
+                strategy = generateMockHedgingStrategy(optionsToAnalyze, currentScore, currentElapsed, safeCashouts);
             }
         } else {
-            // Générer des stratégies calculées si pas d'API
-            console.log("📊 Generating calculated hedging strategies...");
-            strategy = generateCalculatedHedgingStrategies(optionsToAnalyze, currentScore, currentElapsed, safeCashouts, liveData, matchInfo);
+            // Générer une stratégie simulée si pas d'API
+            console.log("📊 Generating simulated hedging strategy...");
+            strategy = generateMockHedgingStrategy(optionsToAnalyze, currentScore, currentElapsed, safeCashouts);
         }
 
         // Envoyer une notification
@@ -1584,8 +1524,9 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
     }
 });
 
-// Fonction helper pour générer des stratégies de hedging calculées
-function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, liveData, matchInfo) {
+// Fonction helper pour générer une stratégie simulée
+// Fonction helper pour générer des stratégies de hedging calculées avec 4 options
+function generateMockHedgingStrategy(options, score, elapsed, cashouts, liveData, matchInfo) {
     const homeScore = score?.home || 0;
     const awayScore = score?.away || 0;
     const totalGoals = homeScore + awayScore;
@@ -1605,7 +1546,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         let analysis = "";
         
         // Logique de statut basée sur le type de pari et le score
-        if (optLower.includes('plus de 2.5') || optLower.includes('over 2.5')) {
+        if (optLower.includes('plus de 2.5') || optLower.includes('over 2.5') || optLower.includes('+2.5')) {
             if (totalGoals > 2) {
                 status = "won";
                 probability = 1;
@@ -1619,7 +1560,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 status = elapsed > 75 ? "losing" : "pending";
                 analysis = `⚠️ ${totalGoals} but(s) - Difficile avec ${timeRemaining}min restantes`;
             }
-        } else if (optLower.includes('moins de 2.5') || optLower.includes('under 2.5')) {
+        } else if (optLower.includes('moins de 2.5') || optLower.includes('under 2.5') || optLower.includes('-2.5')) {
             if (totalGoals > 2) {
                 status = "lost";
                 probability = 0;
@@ -1633,7 +1574,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 status = "winning";
                 analysis = `✅ En bonne voie - ${totalGoals} but(s), ${timeRemaining}min restantes`;
             }
-        } else if (optLower.includes('btts') || optLower.includes('deux équipes')) {
+        } else if (optLower.includes('btts') || optLower.includes('deux équipes') || optLower.includes('les deux')) {
             if (homeScore > 0 && awayScore > 0) {
                 status = "won";
                 probability = 1;
@@ -1647,7 +1588,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 status = elapsed > 75 ? "losing" : "pending";
                 analysis = `⚠️ 0-0 - BTTS devient difficile`;
             }
-        } else if (optLower.includes('victoire') && (optLower.includes('domicile') || optLower.includes(matchInfo?.homeTeam?.toLowerCase() || ''))) {
+        } else if (optLower.includes('victoire') || optLower.includes('gagne') || optLower.includes('win')) {
             if (homeScore > awayScore) {
                 probability = elapsed > 70 ? 0.85 : 0.7;
                 status = "winning";
@@ -1661,7 +1602,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 status = "losing";
                 analysis = `⚠️ Mené ${homeScore}-${awayScore}`;
             }
-        } else if (optLower.includes('nul') || optLower.includes('draw')) {
+        } else if (optLower.includes('nul') || optLower.includes('draw') || optLower.includes('match nul')) {
             if (homeScore === awayScore) {
                 probability = elapsed > 75 ? 0.75 : 0.5;
                 status = "winning";
@@ -1672,7 +1613,9 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 analysis = `⚠️ Score ${homeScore}-${awayScore} - Pas nul`;
             }
         } else {
-            analysis = `📊 Option en cours d'évaluation`;
+            // Estimation par défaut basée sur le temps
+            probability = 0.5;
+            analysis = `📊 Évaluation en cours - ${timeRemaining}min restantes`;
         }
         
         return {
@@ -1684,12 +1627,12 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
             odds: opt.odds || 1.5,
             potentialReturn: Math.round((opt.stake || 0) * (opt.odds || 1.5)),
             potentialProfit: Math.round((opt.stake || 0) * ((opt.odds || 1.5) - 1)),
-            cashout: cashouts[`option_${options.indexOf(opt)}`] || cashouts[opt.option] || null
+            cashout: cashouts[`option_${i}`] || cashouts[opt.option] || null
         };
     });
     
     // Probabilité moyenne de succès
-    const avgWinProbability = optionsStatus.reduce((sum, o) => sum + o.probability, 0) / optionsStatus.length;
+    const avgWinProbability = optionsStatus.reduce((sum, o) => sum + o.probability, 0) / Math.max(optionsStatus.length, 1);
     
     // ========== STRATÉGIE 1: HOLD ==========
     const holdStrategy = {
@@ -1702,10 +1645,10 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         calculations: {
             formula: "Profit = Σ(Mise × Cote) - Total investi",
             details: [
-                `Total investi: ${totalInvested} FCFA`,
-                `Si TOUS gagnants: +${totalPotentialProfit} FCFA`,
-                `Si TOUS perdants: -${totalInvested} FCFA`,
-                `Espérance: ${Math.round(totalPotentialProfit * avgWinProbability - totalInvested * (1 - avgWinProbability))} FCFA`
+                `Total investi: ${totalInvested.toLocaleString()} FCFA`,
+                `Si TOUS gagnants: +${totalPotentialProfit.toLocaleString()} FCFA`,
+                `Si TOUS perdants: -${totalInvested.toLocaleString()} FCFA`,
+                `Espérance: ${Math.round(totalPotentialProfit * avgWinProbability - totalInvested * (1 - avgWinProbability)).toLocaleString()} FCFA`
             ],
             expectedValue: Math.round(totalPotentialProfit * avgWinProbability - totalInvested * (1 - avgWinProbability)),
             variance: totalInvested + totalPotentialProfit
@@ -1713,15 +1656,15 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         scenarios: [
             {
                 name: "✅ Tous les paris gagnants",
-                probability: Math.round(avgWinProbability * 100) / 100,
+                probability: avgWinProbability,
                 profit: totalPotentialProfit,
-                explanation: `Gain: ${totalPotentialReturn} - ${totalInvested} = +${totalPotentialProfit} FCFA`
+                explanation: `Gain: ${totalPotentialReturn.toLocaleString()} - ${totalInvested.toLocaleString()} = +${totalPotentialProfit.toLocaleString()} FCFA`
             },
             {
                 name: "❌ Tous les paris perdants",
-                probability: Math.round((1 - avgWinProbability) * 100) / 100,
+                probability: 1 - avgWinProbability,
                 profit: -totalInvested,
-                explanation: `Perte totale de la mise: -${totalInvested} FCFA`
+                explanation: `Perte totale de la mise: -${totalInvested.toLocaleString()} FCFA`
             }
         ],
         actions: [],
@@ -1735,7 +1678,7 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
             "Aucune garantie de profit",
             "Stress jusqu'à la fin du match"
         ],
-        summary: `Garder les ${options.length} paris. Profit potentiel: +${totalPotentialProfit} FCFA | Risque: -${totalInvested} FCFA`
+        summary: `Garder les ${options.length} paris. Profit max: +${totalPotentialProfit.toLocaleString()} F | Risque: -${totalInvested.toLocaleString()} F`
     };
     
     // ========== STRATÉGIE 2: CASHOUT TOTAL ==========
@@ -1750,9 +1693,9 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         calculations: {
             formula: "Profit = Cashout Total - Total investi",
             details: [
-                `Total investi: ${totalInvested} FCFA`,
-                `Cashout proposé: ${totalCashout || 'N/A'} FCFA`,
-                `Profit immédiat: ${cashoutProfit > 0 ? '+' : ''}${cashoutProfit || 'N/A'} FCFA`,
+                `Total investi: ${totalInvested.toLocaleString()} FCFA`,
+                `Cashout proposé: ${totalCashout ? totalCashout.toLocaleString() : 'Non renseigné'} FCFA`,
+                `Profit immédiat: ${totalCashout ? (cashoutProfit > 0 ? '+' : '') + cashoutProfit.toLocaleString() : 'N/A'} FCFA`,
                 `% récupéré: ${totalCashout ? Math.round(totalCashout / totalInvested * 100) : 'N/A'}%`
             ],
             expectedValue: cashoutProfit || 0,
@@ -1764,16 +1707,16 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 probability: 1,
                 profit: cashoutProfit || 0,
                 explanation: totalCashout 
-                    ? `${totalCashout} - ${totalInvested} = ${cashoutProfit > 0 ? '+' : ''}${cashoutProfit} FCFA (garanti)`
-                    : "Cashout non disponible"
+                    ? `${totalCashout.toLocaleString()} - ${totalInvested.toLocaleString()} = ${cashoutProfit > 0 ? '+' : ''}${cashoutProfit.toLocaleString()} FCFA (garanti)`
+                    : "⚠️ Renseignez les valeurs de cashout pour cette option"
             }
         ],
-        actions: optionsStatus.map(opt => ({
+        actions: totalCashout > 0 ? optionsStatus.map(opt => ({
             option: opt.option,
             action: "CASHOUT",
             amount: opt.cashout || Math.round(opt.stake * 0.85),
             reason: "Sécuriser les fonds"
-        })),
+        })) : [],
         pros: [
             "Profit/récupération garantie immédiatement",
             "Aucun risque de perte supplémentaire",
@@ -1785,56 +1728,54 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
             "Impossible de revenir en arrière"
         ],
         summary: totalCashout 
-            ? `Encaisser ${totalCashout} FCFA maintenant (${cashoutProfit >= 0 ? '+' : ''}${cashoutProfit} FCFA de profit)`
-            : "Cashout non disponible - Renseignez les valeurs de cashout"
+            ? `Encaisser ${totalCashout.toLocaleString()} F maintenant (${cashoutProfit >= 0 ? '+' : ''}${cashoutProfit.toLocaleString()} F de profit)`
+            : "⚠️ Renseignez les valeurs de cashout dans le formulaire"
     };
     
     // ========== STRATÉGIE 3: HEDGE PARTIEL ==========
-    // Calculer une couverture partielle (50% de protection)
     const hedgePercentage = 0.5;
-    const hedgeStakePartial = Math.round(totalPotentialReturn * hedgePercentage / 2); // Mise pour hedge
-    const hedgeOdds = 2.0; // Cote moyenne pour le hedge
-    const guaranteedProfitPartial = Math.round((totalPotentialProfit * (1 - hedgePercentage)) - hedgeStakePartial);
+    const hedgeOdds = 2.0;
+    const hedgeStakePartial = Math.round(totalPotentialReturn * hedgePercentage / hedgeOdds);
     const maxLossPartial = Math.round(totalInvested * hedgePercentage + hedgeStakePartial);
     
     const hedgePartialStrategy = {
         id: "hedge_partiel",
-        name: "🛡️ HEDGE PARTIEL",
+        name: "🛡️ HEDGE PARTIEL (50%)",
         description: "Couvrir 50% de la position pour réduire le risque",
         riskLevel: "medium",
         riskScore: 5,
         recommended: avgWinProbability >= 0.4 && avgWinProbability <= 0.6,
         calculations: {
-            formula: "Hedge = (Retour potentiel × % couverture) ÷ Cote opposée",
+            formula: "Hedge = (Retour potentiel × 50%) ÷ Cote opposée",
             details: [
-                `Couverture: ${hedgePercentage * 100}%`,
-                `Mise de hedge: ${hedgeStakePartial} FCFA @ ${hedgeOdds}`,
-                `Si pari initial gagne: +${Math.round(totalPotentialProfit - hedgeStakePartial)} FCFA`,
-                `Si hedge gagne: -${Math.round(totalInvested - (hedgeStakePartial * hedgeOdds))} FCFA`,
-                `Variance réduite de ${Math.round(hedgePercentage * 100)}%`
+                `Couverture: 50% de la position`,
+                `Mise de hedge: ${hedgeStakePartial.toLocaleString()} FCFA @ ${hedgeOdds.toFixed(2)}`,
+                `Si pari initial gagne: +${Math.round(totalPotentialProfit - hedgeStakePartial).toLocaleString()} FCFA`,
+                `Si hedge gagne: ${Math.round(hedgeStakePartial * hedgeOdds - totalInvested - hedgeStakePartial).toLocaleString()} FCFA`,
+                `Variance réduite de 50%`
             ],
             expectedValue: Math.round((totalPotentialProfit - hedgeStakePartial) * avgWinProbability - maxLossPartial * (1 - avgWinProbability)),
-            variance: Math.round((totalInvested + totalPotentialProfit) * (1 - hedgePercentage))
+            variance: Math.round((totalInvested + totalPotentialProfit) * 0.5)
         },
         scenarios: [
             {
                 name: "✅ Paris initiaux gagnants",
                 probability: avgWinProbability,
                 profit: Math.round(totalPotentialProfit - hedgeStakePartial),
-                explanation: `Gain: ${totalPotentialProfit} - mise hedge ${hedgeStakePartial} = +${totalPotentialProfit - hedgeStakePartial} FCFA`
+                explanation: `${totalPotentialProfit.toLocaleString()} - mise hedge ${hedgeStakePartial.toLocaleString()} = +${(totalPotentialProfit - hedgeStakePartial).toLocaleString()} FCFA`
             },
             {
                 name: "🛡️ Hedge gagne",
                 probability: 1 - avgWinProbability,
                 profit: Math.round(hedgeStakePartial * hedgeOdds - totalInvested - hedgeStakePartial),
-                explanation: `Retour hedge: ${hedgeStakePartial * hedgeOdds} - pertes: ${totalInvested + hedgeStakePartial}`
+                explanation: `Retour hedge: ${(hedgeStakePartial * hedgeOdds).toLocaleString()} - pertes: ${(totalInvested + hedgeStakePartial).toLocaleString()}`
             }
         ],
         actions: [
             {
-                option: "Pari de couverture",
+                option: "Pari de couverture partielle",
                 action: "PLACER",
-                bet: "Résultat opposé aux paris actuels",
+                bet: "Résultat opposé (ex: victoire adverse ou nul)",
                 amount: hedgeStakePartial,
                 odds: hedgeOdds,
                 reason: "Réduire le risque de 50%"
@@ -1847,14 +1788,13 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         ],
         cons: [
             "Profit réduit si les paris initiaux gagnent",
-            "Coût du hedge",
+            "Coût du hedge: " + hedgeStakePartial.toLocaleString() + " FCFA",
             "Complexité de l'exécution"
         ],
-        summary: `Placer ${hedgeStakePartial} FCFA sur le résultat opposé. Profit réduit mais risque divisé par 2.`
+        summary: `Placer ${hedgeStakePartial.toLocaleString()} F sur le résultat opposé @${hedgeOdds}. Risque divisé par 2.`
     };
     
     // ========== STRATÉGIE 4: HEDGE TOTAL (Break-Even) ==========
-    // Calculer la couverture totale pour garantir un profit
     const hedgeStakeTotal = Math.round(totalPotentialReturn / hedgeOdds);
     const guaranteedProfitTotal = Math.round(totalPotentialProfit - hedgeStakeTotal);
     const breakEvenIfHedgeWins = Math.round(hedgeStakeTotal * hedgeOdds - totalInvested - hedgeStakeTotal);
@@ -1869,11 +1809,11 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         calculations: {
             formula: "Hedge Total = Retour potentiel ÷ Cote opposée",
             details: [
-                `Retour potentiel: ${totalPotentialReturn} FCFA`,
-                `Mise de hedge nécessaire: ${hedgeStakeTotal} FCFA @ ${hedgeOdds}`,
-                `Si pari initial gagne: +${guaranteedProfitTotal} FCFA`,
-                `Si hedge gagne: ${breakEvenIfHedgeWins >= 0 ? '+' : ''}${breakEvenIfHedgeWins} FCFA`,
-                `Profit garanti minimum: ${Math.min(guaranteedProfitTotal, breakEvenIfHedgeWins)} FCFA`
+                `Retour potentiel: ${totalPotentialReturn.toLocaleString()} FCFA`,
+                `Mise de hedge: ${hedgeStakeTotal.toLocaleString()} FCFA @ ${hedgeOdds.toFixed(2)}`,
+                `Si pari initial gagne: +${guaranteedProfitTotal.toLocaleString()} FCFA`,
+                `Si hedge gagne: ${breakEvenIfHedgeWins >= 0 ? '+' : ''}${breakEvenIfHedgeWins.toLocaleString()} FCFA`,
+                `Profit garanti: ${Math.min(guaranteedProfitTotal, breakEvenIfHedgeWins).toLocaleString()} FCFA minimum`
             ],
             expectedValue: Math.round((guaranteedProfitTotal + breakEvenIfHedgeWins) / 2),
             variance: Math.abs(guaranteedProfitTotal - breakEvenIfHedgeWins)
@@ -1883,13 +1823,13 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
                 name: "✅ Paris initiaux gagnants",
                 probability: avgWinProbability,
                 profit: guaranteedProfitTotal,
-                explanation: `${totalPotentialReturn} - ${totalInvested} - ${hedgeStakeTotal} = +${guaranteedProfitTotal} FCFA`
+                explanation: `${totalPotentialReturn.toLocaleString()} - ${totalInvested.toLocaleString()} - ${hedgeStakeTotal.toLocaleString()} = +${guaranteedProfitTotal.toLocaleString()} FCFA`
             },
             {
                 name: "🛡️ Hedge gagne",
                 probability: 1 - avgWinProbability,
                 profit: breakEvenIfHedgeWins,
-                explanation: `${hedgeStakeTotal * hedgeOdds} - ${totalInvested} - ${hedgeStakeTotal} = ${breakEvenIfHedgeWins >= 0 ? '+' : ''}${breakEvenIfHedgeWins} FCFA`
+                explanation: `${(hedgeStakeTotal * hedgeOdds).toLocaleString()} - ${totalInvested.toLocaleString()} - ${hedgeStakeTotal.toLocaleString()} = ${breakEvenIfHedgeWins >= 0 ? '+' : ''}${breakEvenIfHedgeWins.toLocaleString()} FCFA`
             }
         ],
         actions: [
@@ -1909,10 +1849,10 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         ],
         cons: [
             "Profit limité comparé au HOLD",
-            "Nécessite un capital supplémentaire",
+            "Nécessite " + hedgeStakeTotal.toLocaleString() + " FCFA supplémentaires",
             "Profit potentiellement faible si hedge gagne"
         ],
-        summary: `Placer ${hedgeStakeTotal} FCFA pour garantir entre ${Math.min(guaranteedProfitTotal, breakEvenIfHedgeWins)} et ${Math.max(guaranteedProfitTotal, breakEvenIfHedgeWins)} FCFA de profit.`
+        summary: `Placer ${hedgeStakeTotal.toLocaleString()} F pour garantir entre ${Math.min(guaranteedProfitTotal, breakEvenIfHedgeWins).toLocaleString()} et ${Math.max(guaranteedProfitTotal, breakEvenIfHedgeWins).toLocaleString()} F de profit.`
     };
     
     // Déterminer la stratégie recommandée
@@ -1921,16 +1861,21 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
     
     if (avgWinProbability >= 0.7) {
         recommendedStrategy = "hold";
-        reasoning = "Probabilité élevée de succès - Maintenir pour maximiser le profit";
+        reasoning = `Probabilité de succès élevée (${Math.round(avgWinProbability * 100)}%) - Maintenir les paris pour maximiser le profit`;
     } else if (avgWinProbability <= 0.3) {
         recommendedStrategy = totalCashout > totalInvested * 0.8 ? "cashout" : "hedge_total";
-        reasoning = "Situation défavorable - Sécuriser les fonds";
+        reasoning = `Situation défavorable (${Math.round(avgWinProbability * 100)}% de chances) - Sécuriser les fonds avant qu'il soit trop tard`;
     } else if (avgWinProbability > 0.5) {
         recommendedStrategy = "hedge_partiel";
-        reasoning = "Situation favorable mais incertaine - Réduire le risque tout en gardant du potentiel";
+        reasoning = `Situation favorable mais incertaine (${Math.round(avgWinProbability * 100)}%) - Réduire le risque tout en gardant du potentiel de gain`;
     } else {
         recommendedStrategy = "hedge_total";
-        reasoning = "Incertitude élevée - Garantir un profit minimum";
+        reasoning = `Incertitude élevée (${Math.round(avgWinProbability * 100)}%) - Garantir un profit minimum plutôt que risquer une perte totale`;
+    }
+    
+    // Ajuster elapsed pour la recommandation de fin de match
+    if (elapsed >= 80) {
+        reasoning += ` | ⏰ Fin de match imminente (${elapsed}') - Décision urgente requise.`;
     }
     
     // Marquer la stratégie recommandée
@@ -1942,8 +1887,8 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
     return {
         matchAnalysis: {
             currentSituation: `Score ${homeScore}-${awayScore} à la ${elapsed}'. ${timeRemaining} minutes restantes.`,
-            trendsObserved: `${totalGoals} but(s) - Match ${totalGoals > 2 ? 'ouvert' : totalGoals === 0 ? 'fermé' : 'équilibré'}`,
-            riskAssessment: `Probabilité moyenne de succès: ${Math.round(avgWinProbability * 100)}%`
+            trendsObserved: `${totalGoals} but(s) marqué(s) - Match ${totalGoals > 2 ? 'ouvert et offensif' : totalGoals === 0 ? 'fermé et défensif' : 'équilibré'}`,
+            riskAssessment: `Probabilité moyenne de succès de vos paris: ${Math.round(avgWinProbability * 100)}%`
         },
         optionsStatus,
         strategies: [holdStrategy, cashoutStrategy, hedgePartialStrategy, hedgeTotalStrategy],
@@ -1951,8 +1896,8 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
         confidence: avgWinProbability,
         reasoning,
         summary: elapsed >= 75 
-            ? `Fin de match proche (${elapsed}'). ${recommendedStrategy === 'hold' ? 'Maintenir si en bonne voie.' : 'Envisager de sécuriser.'}`
-            : `Match en cours (${elapsed}'). Stratégie recommandée: ${recommendedStrategy.toUpperCase()}`,
+            ? `⏰ Fin de match proche (${elapsed}'). Stratégie recommandée: ${recommendedStrategy.toUpperCase()}`
+            : `Match en cours (${elapsed}'). ${options.length} paris analysés. Recommandation: ${recommendedStrategy.toUpperCase()}`,
         calculations: {
             totalInvested,
             totalPotentialProfit,
@@ -1961,15 +1906,23 @@ function generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, 
             avgWinProbability: Math.round(avgWinProbability * 100),
             timeRemaining
         },
+        // Compatibilité avec l'ancien format
+        recommendation: recommendedStrategy === "hold" ? "hold" : recommendedStrategy === "cashout" ? "secure" : "hedge",
+        analysis: `🎯 Analyse à la ${elapsed}' - Score: ${homeScore} - ${awayScore}\n\n📊 ${optionsStatus.length} option(s) analysée(s)\n⏱️ Temps restant: ${timeRemaining} minutes\n💰 Total investi: ${totalInvested.toLocaleString()} FCFA\n\n${reasoning}`,
+        options: optionsStatus.map(opt => ({
+            option: opt.option,
+            currentStatus: opt.status,
+            recommendation: opt.status === "won" || opt.status === "winning" ? "hold" : opt.status === "lost" || opt.status === "losing" ? "cashout" : "monitor",
+            stake: opt.stake,
+            odds: opt.odds,
+            potentialProfit: opt.potentialProfit,
+            cashoutValue: opt.cashout,
+            analysis: opt.analysis
+        })),
         isDemo: true,
         generatedAt: new Date().toISOString(),
         engine: "calculated"
     };
-}
-
-// Ancienne fonction pour compatibilité
-function generateMockHedgingStrategy(options, score, elapsed, cashouts) {
-    return generateCalculatedHedgingStrategies(options, score, elapsed, cashouts, null, {});
 }
 
 /**
