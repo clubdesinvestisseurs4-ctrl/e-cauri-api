@@ -763,9 +763,63 @@ function generateMockPrediction(matchData, userBalance, bookmaker) {
         },
         oddsAnalysis: {
             recommendedOptions: [
-                { option: `Victoire ${homeTeam}`, odds: 1.45, estimatedProbability: 0.55, riskLevel: "low", value: 1.20 },
-                { option: "Plus de 2.5 buts", odds: 1.70, estimatedProbability: 0.68, riskLevel: "medium", value: 1.15 },
-                { option: "BTTS Oui", odds: 1.85, estimatedProbability: 0.65, riskLevel: "medium", value: 1.21 }
+                { 
+                    option: `Victoire ${homeTeam}`, 
+                    odds: 1.45, 
+                    estimatedProbability: 0.55, 
+                    riskLevel: "low", 
+                    value: 1.20,
+                    reasoning: `${homeTeam} est favori à domicile avec un avantage terrain significatif.`,
+                    factors: [
+                        `Avantage du terrain (65% de victoires à domicile)`,
+                        `Série de 3 victoires consécutives`,
+                        `Meilleur buteur en forme (5 buts sur 3 matchs)`
+                    ],
+                    statistics: [
+                        "W-D-L domicile: 8-2-1",
+                        "Moyenne: 2.1 buts/match",
+                        "4 clean sheets sur 5"
+                    ],
+                    conditions: []
+                },
+                { 
+                    option: "Plus de 2.5 buts", 
+                    odds: 1.70, 
+                    estimatedProbability: 0.68, 
+                    riskLevel: "medium", 
+                    value: 1.15,
+                    reasoning: "Les deux équipes jouent offensif, favorisant les matchs avec plusieurs buts.",
+                    factors: [
+                        "Moyenne combinée de 3.2 buts/match",
+                        "7 des 10 derniers H2H: +2.5 buts",
+                        "Défenses fragiles des deux côtés"
+                    ],
+                    statistics: [
+                        "Over 2.5 domicile: 70%",
+                        "Over 2.5 extérieur: 65%",
+                        "H2H: 3.1 buts/match"
+                    ],
+                    conditions: ["Météo favorable au jeu offensif"]
+                },
+                { 
+                    option: "BTTS Oui", 
+                    odds: 1.85, 
+                    estimatedProbability: 0.65, 
+                    riskLevel: "medium", 
+                    value: 1.21,
+                    reasoning: "Ces équipes marquent souvent lors de leurs confrontations directes.",
+                    factors: [
+                        "BTTS dans 6/8 dernières confrontations",
+                        "Les deux marquent dans 75% des matchs récents",
+                        "Styles de jeu offensifs compatibles"
+                    ],
+                    statistics: [
+                        "BTTS domicile: 72%",
+                        "BTTS extérieur: 68%",
+                        "H2H BTTS: 75%"
+                    ],
+                    conditions: ["Pas de blessure majeure en attaque"]
+                }
             ],
             bestValue: "BTTS Oui",
             safestOption: `Victoire ${homeTeam}`
