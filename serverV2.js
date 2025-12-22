@@ -1524,13 +1524,13 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                 {
                     "name": "Tous paris gagnants",
                     "probability": 0.40,
-                    "result": 1500,
+                    "profit": 1500,
                     "explanation": "Calcul: 500×1.5 + 400×2.0 - 900 = +600 FCFA"
                 },
                 {
                     "name": "Tous paris perdants",
                     "probability": 0.30,
-                    "result": -900,
+                    "profit": -900,
                     "explanation": "Perte de la mise totale: -900 FCFA"
                 }
             ],
@@ -1648,10 +1648,9 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                     data: { predictionId }
                 });
                 
-                // Sauvegarder la stratégie
+                // Sauvegarder la stratégie (pas de verrouillage - analyses multiples permises)
                 await firestoreService.updatePrediction(predictionId, {
-                    hedgingAnalyzed: true,
-                    hedgingAnalyzedAt: new Date().toISOString(),
+                    lastHedgingAt: new Date().toISOString(),
                     hedgingStrategy: strategy,
                     hedgingLiveData: {
                         score: currentScore,
@@ -1661,7 +1660,7 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                         preMatchOdds: liveData?.preMatchOdds || null
                     }
                 });
-                console.log(`✅ Prediction ${predictionId} marked as hedgingAnalyzed`);
+                console.log(`✅ Prediction ${predictionId} hedging strategy updated`);
                 
             } catch (notifError) {
                 console.warn("Could not send notification or update prediction:", notifError.message);
@@ -1679,8 +1678,7 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                 preMatchOdds: liveData?.preMatchOdds || null,
                 oddsAvailable: !!(liveData?.odds?.length > 0 || liveData?.preMatchOdds)
             },
-            hedgingAllowed: true,
-            hedgingAnalyzed: true
+            hedgingAllowed: true
         });
 
     } catch (error) {
