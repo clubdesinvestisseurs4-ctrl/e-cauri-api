@@ -583,59 +583,11 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
             prediction.isDemo = true;
         }
 
-        // ========== CALCUL DES STAKES SI VIDES ==========
-        // Si l'IA n'a pas généré de stakes, les calculer à partir des options recommandées
-        if (!prediction.stakes?.stakes?.length && prediction.oddsAnalysis?.recommendedOptions?.length) {
-            console.log(`📊 Calculating stakes from recommended options (${validatedPercentage}% budget)...`);
-            
-            const options = prediction.oddsAnalysis.recommendedOptions;
-            const maxBudget = Math.round(userBalance * validatedPercentage / 100); // Utiliser le pourcentage choisi
-            const maxPerBet = validatedPercentage / 100; // Limite par pari
-            
-            // Calculer les stakes basées sur Kelly simplifié
-            const calculatedStakes = options.slice(0, 3).map((opt, index) => {
-                const prob = opt.estimatedProbability || opt.probability || 0.5;
-                const odds = opt.odds || 1.5;
-                
-                // Kelly simplifié: f = (p * b - q) / b où p=prob, b=odds-1, q=1-p
-                const b = odds - 1;
-                const q = 1 - prob;
-                let kellyFraction = Math.max(0, (prob * b - q) / b);
-                
-                // Limiter au pourcentage max par pari
-                kellyFraction = Math.min(kellyFraction, maxPerBet);
-                
-                // Répartir le budget selon Kelly
-                const stake = Math.round(userBalance * kellyFraction) || Math.round(maxBudget / options.length);
-                
-                return {
-                    option: opt.option,
-                    odds: odds,
-                    stake: stake,
-                    adjustedStake: stake,
-                    potentialReturn: Math.round(stake * odds),
-                    kellyPercentage: Math.round(kellyFraction * 100 * 10) / 10,
-                    probability: prob,
-                    riskLevel: opt.riskLevel || 'medium'
-                };
-            });
-            
-            const totalStake = calculatedStakes.reduce((sum, s) => sum + s.stake, 0);
-            
-            prediction.stakes = {
-                totalBudget: totalStake,
-                totalStake: totalStake,
-                maxBudgetAllowed: maxBudget,
-                stakes: calculatedStakes,
-                expectedValue: Math.round(totalStake * 0.12),
-                expectedROI: 12,
-                riskLevel: 'medium',
-                calculations: `Calculé automatiquement avec Kelly sur ${calculatedStakes.length} options`
-            };
-            
-            console.log(`✅ Stakes calculated:`, prediction.stakes.stakes.map(s => `${s.option}: ${s.stake} FCFA`));
-        }
-        // ================================================
+        // ========== STAKES: CALCUL DÉPLACÉ AU FRONTEND ==========
+        // Les stakes sont maintenant calculées côté frontend avec le pourcentage choisi
+        // Le backend stocke uniquement le pourcentage et les options recommandées par l'IA
+        console.log(`📊 Stake percentage saved: ${validatedPercentage}% (calculation done on frontend)`);
+        // ========================================================
 
         // Sauvegarder la prédiction dans Firebase
         const predictionData = {
@@ -649,11 +601,12 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
                 matchDate: matchData.matchDate || new Date().toISOString()
             },
             userBalance,
+            stakePercentage: validatedPercentage, // Pourcentage choisi pour calcul Kelly frontend
             bookmaker: bookmaker || 'default',
             aiAnalysis: prediction.matchAnalysis || null,
             oddsAnalysis: prediction.oddsAnalysis || null,
             synthesis: prediction.synthesis || null,
-            stakes: prediction.stakes || null,
+            stakes: null, // Stakes calculées au frontend maintenant
             selectedBookmaker: prediction.selectedBookmaker || null,
             selectedOptions: [],
             status: 'analyzed', // Analyse terminée, en attente de validation
@@ -731,12 +684,6 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
 function generateMockPrediction(matchData, userBalance, bookmaker) {
     const homeTeam = matchData.homeTeam || 'Équipe A';
     const awayTeam = matchData.awayTeam || 'Équipe B';
-    
-    // Calculer les stakes basées sur Kelly
-    const stake1 = Math.round(userBalance * 0.025);
-    const stake2 = Math.round(userBalance * 0.020);
-    const stake3 = Math.round(userBalance * 0.015);
-    const totalBudget = stake1 + stake2 + stake3;
     
     return {
         matchAnalysis: {
@@ -830,39 +777,7 @@ function generateMockPrediction(matchData, userBalance, bookmaker) {
             divergencePoints: [],
             coverageScore: 0.75
         },
-        stakes: {
-            totalBudget: totalBudget,
-            totalStake: totalBudget,
-            maxBudgetAllowed: Math.round(userBalance * 0.06),
-            stakes: [
-                { 
-                    option: `Victoire ${homeTeam}`, 
-                    odds: 1.45, 
-                    stake: stake1,
-                    adjustedStake: stake1, 
-                    potentialReturn: Math.round(stake1 * 1.45),
-                    kellyPercentage: 2.5
-                },
-                { 
-                    option: "Plus de 2.5 buts", 
-                    odds: 1.70, 
-                    stake: stake2,
-                    adjustedStake: stake2,
-                    potentialReturn: Math.round(stake2 * 1.70),
-                    kellyPercentage: 2.0
-                },
-                { 
-                    option: "BTTS Oui", 
-                    odds: 1.85, 
-                    stake: stake3,
-                    adjustedStake: stake3,
-                    potentialReturn: Math.round(stake3 * 1.85),
-                    kellyPercentage: 1.5
-                }
-            ],
-            expectedValue: Math.round(totalBudget * 0.15),
-            riskLevel: "medium"
-        },
+        stakes: null, // Stakes calculées au frontend maintenant
         selectedBookmaker: {
             key: bookmaker || 'default',
             name: bookmaker ? bookmaker.charAt(0).toUpperCase() + bookmaker.slice(1) : 'Default',
