@@ -738,21 +738,13 @@ class PredictionService {
                 recommendedOptions
             );
 
-            // ÉTAPE 3.2: Calcul des mises Kelly
+            // ========== ÉTAPE 3.2 SUPPRIMÉE ==========
+            // Le calcul des mises (Kelly) est maintenant fait au FRONTEND
+            // Le backend retourne uniquement les pourcentages de confiance (probabilités)
+            // L'utilisateur choisit ses options et les mises sont calculées dynamiquement
             console.log("\n" + "━".repeat(50));
-            console.log("🧮 ÉTAPE 3.2: Calcul des mises (Kelly)...");
+            console.log("📊 Mises: Calcul déplacé au frontend (Kelly dynamique)");
             console.log("━".repeat(50));
-            
-            const stakes = await this.calculateStakes(
-                userCapital,
-                minBet,
-                maxPercentage,
-                recommendedOptions.map(opt => ({
-                    option: opt.option,
-                    odds: opt.odds,
-                    probability: opt.estimatedProbability || opt.probability || 0.5
-                }))
-            );
 
             console.log("\n✅ Pipeline completed successfully!");
             console.log("━".repeat(50));
@@ -761,7 +753,7 @@ class PredictionService {
                 matchAnalysis,
                 oddsAnalysis,
                 synthesis,
-                stakes,
+                stakes: null, // Calculées au frontend maintenant
                 selectedBookmaker: {
                     key: bookmakerKey,
                     odds: selectedOdds,
