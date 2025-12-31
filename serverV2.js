@@ -3015,6 +3015,182 @@ app.get('/api/predictions/:id/track', authMiddleware, async (req, res) => {
 });
 
 /**
+ * GET /api/predictions/:id/live-tracking
+ * Suivi avancé en temps réel avec évolution des cotes et probabilités dynamiques
+ */
+app.get('/api/predictions/:id/live-tracking', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Récupérer la prédiction
+        let prediction;
+        if (firestoreService) {
+            prediction = await firestoreService.getPredictionById(id);
+            if (!prediction) {
+                return res.status(404).json({ error: "Prediction not found" });
+            }
+        } else {
+            return res.json({
+                tracking: {
+                    predictionId: id,
+                    matchStatus: { status: 'NS', canHedge: false, hasStarted: false, elapsed: 45, score: { home: 1, away: 0 } },
+                    options: [],
+                    events: [
+                        { time: 23, type: 'Goal', team: 'Équipe A', player: 'Joueur Test', detail: 'Normal Goal' }
+                    ],
+                    globalStatus: { status: 'demo', message: 'Mode démo - pas de suivi réel', avgProbability: 65 },
+                    message: "Mode démo - pas de suivi en temps réel"
+                }
+            });
+        }
+
+        // Récupérer les infos nécessaires
+        const fixtureId = prediction.matchInfo?.fixtureId || 
+                         prediction.meta?.matchId ||
+                         prediction.opportunityId;
+        
+        const bookmaker = prediction.bookmaker || prediction.selectedBookmaker?.key || '1xbet';
+        const userCapital = prediction.userBalance || 10000;
+        const maxPercentage = (prediction.stakePercentage || 6) / 100;
+
+        // Récupérer les options à suivre
+        let optionsToTrack = prediction.selectedOptions || [];
+        if (optionsToTrack.length === 0 && prediction.stakes?.stakes) {
+            optionsToTrack = prediction.stakes.stakes;
+        }
+        if (optionsToTrack.length === 0 && prediction.oddsAnalysis?.recommendedOptions) {
+            optionsToTrack = prediction.oddsAnalysis.recommendedOptions.map(opt => ({
+                ...opt,
+                stake: Math.round(userCapital * maxPercentage / 3)
+            }));
+        }
+
+        if (!fixtureId || !liveFootballService) {
+            return res.json({
+                tracking: {
+                    predictionId: id,
+                    matchStatus: null,
+                    options: optionsToTrack,
+                    events: [],
+                    globalStatus: { status: 'unavailable', message: 'Suivi non disponible', avgProbability: 50 },
+                    message: fixtureId ? "Service live non disponible" : "ID du match non trouvé"
+                }
+            });
+        }
+
+        // Utiliser le suivi complet avancé
+        const tracking = await liveFootballService.getFullLiveTracking(
+            parseInt(fixtureId),
+            optionsToTrack,
+            bookmaker,
+            userCapital,
+            maxPercentage
+        );
+
+        if (tracking.error) {
+            return res.json({
+                tracking: {
+                    predictionId: id,
+                    matchStatus: null,
+                    options: optionsToTrack,
+                    events: [],
+                    globalStatus: { status: 'error', message: tracking.message, avgProbability: 50 },
+                    message: tracking.message
+                }
+            });
+        }
+
+        // Sauvegarder le statut live dans Firebase
+        if (firestoreService && tracking.matchStatus) {
+            await firestoreService.updatePredictionLiveStatus(id, {
+                matchStatus: tracking.matchStatus,
+                evaluatedOptions: tracking.options,
+                globalStatus: tracking.globalStatus,
+                liveOdds: tracking.liveOdds,
+                events: tracking.events,
+                lastUpdate: new Date().toISOString()
+            });
+        }
+
+        res.json({
+            tracking: {
+                predictionId: id,
+                matchStatus: tracking.matchStatus,
+                options: tracking.options,
+                events: tracking.events,
+                statistics: tracking.statistics,
+                liveOdds: tracking.liveOdds,
+                globalStatus: tracking.globalStatus,
+                canHedge: tracking.canHedge,
+                fetchedAt: tracking.fetchedAt
+            }
+        });
+
+    } catch (error) {
+        console.error("Error in live tracking:", error);
+        res.status(500).json({ error: "Failed to get live tracking", details: error.message });
+    }
+});
+
+/**
+ * POST /api/predictions/:id/recalculate-stakes
+ * Recalcule les mises avec les nouvelles cotes live
+ */
+app.post('/api/predictions/:id/recalculate-stakes', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { currentOdds, userCapital, maxPercentage } = req.body;
+
+        if (!liveFootballService) {
+            return res.status(503).json({ error: "Live service not available" });
+        }
+
+        // Récupérer la prédiction
+        let prediction;
+        if (firestoreService) {
+            prediction = await firestoreService.getPredictionById(id);
+        }
+
+        if (!prediction) {
+            return res.status(404).json({ error: "Prediction not found" });
+        }
+
+        const capital = userCapital || prediction.userBalance || 10000;
+        const maxPct = maxPercentage || (prediction.stakePercentage || 6) / 100;
+
+        // Recalculer les mises pour chaque option
+        const recalculatedOptions = (currentOdds || []).map(opt => {
+            // Utiliser la probabilité dynamique si fournie, sinon 50%
+            const probability = opt.dynamicProbability || 50;
+            const newStake = liveFootballService.recalculateStake(
+                probability,
+                opt.currentOdds || opt.odds,
+                capital,
+                maxPct
+            );
+
+            return {
+                option: opt.option,
+                originalOdds: opt.originalOdds || opt.odds,
+                currentOdds: opt.currentOdds || opt.odds,
+                ...newStake
+            };
+        });
+
+        res.json({
+            recalculatedStakes: recalculatedOptions,
+            totalCapital: capital,
+            maxPercentage: maxPct * 100,
+            calculatedAt: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error("Error recalculating stakes:", error);
+        res.status(500).json({ error: "Failed to recalculate stakes", details: error.message });
+    }
+});
+
+/**
  * POST /api/predictions/:id/finalize
  * Finalise une prédiction avec les résultats finaux et met à jour le capital
  */
