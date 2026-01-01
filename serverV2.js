@@ -3107,6 +3107,7 @@ app.get('/api/predictions/:id/live-tracking', authMiddleware, async (req, res) =
                 evaluatedOptions: tracking.options,
                 globalStatus: tracking.globalStatus,
                 liveOdds: tracking.liveOdds,
+                hedgingOdds: tracking.hedgingOdds,
                 events: tracking.events,
                 lastUpdate: new Date().toISOString()
             });
@@ -3120,6 +3121,7 @@ app.get('/api/predictions/:id/live-tracking', authMiddleware, async (req, res) =
                 events: tracking.events,
                 statistics: tracking.statistics,
                 liveOdds: tracking.liveOdds,
+                hedgingOdds: tracking.hedgingOdds, // Cotes pour les paris de couverture
                 globalStatus: tracking.globalStatus,
                 canHedge: tracking.canHedge,
                 fetchedAt: tracking.fetchedAt
@@ -3129,6 +3131,104 @@ app.get('/api/predictions/:id/live-tracking', authMiddleware, async (req, res) =
     } catch (error) {
         console.error("Error in live tracking:", error);
         res.status(500).json({ error: "Failed to get live tracking", details: error.message });
+    }
+});
+
+/**
+ * GET /api/predictions/:id/hedging-odds
+ * Récupère les cotes actualisées pour les stratégies de couverture
+ */
+app.get('/api/predictions/:id/hedging-odds', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Récupérer la prédiction
+        let prediction;
+        if (firestoreService) {
+            prediction = await firestoreService.getPredictionById(id);
+        }
+
+        if (!prediction) {
+            return res.status(404).json({ error: "Prediction not found" });
+        }
+
+        const fixtureId = prediction.matchInfo?.fixtureId || 
+                         prediction.meta?.matchId ||
+                         prediction.opportunityId;
+        
+        const bookmaker = prediction.bookmaker || prediction.selectedBookmaker?.key || '1xbet';
+
+        if (!fixtureId || !liveFootballService) {
+            return res.json({
+                hedgingOdds: null,
+                message: "Service live non disponible"
+            });
+        }
+
+        // Récupérer les cotes live
+        const liveOdds = await liveFootballService.getLiveOddsForBookmaker(
+            parseInt(fixtureId),
+            bookmaker
+        );
+
+        if (!liveOdds) {
+            return res.json({
+                hedgingOdds: null,
+                message: "Cotes live non disponibles"
+            });
+        }
+
+        // Récupérer le statut du match
+        const matchStatus = await liveFootballService.getMatchStatus(parseInt(fixtureId));
+
+        // Récupérer les options de la prédiction
+        let selectedOptions = prediction.selectedOptions || [];
+        if (selectedOptions.length === 0 && prediction.stakes?.stakes) {
+            selectedOptions = prediction.stakes.stakes;
+        }
+
+        // Calculer les cotes de hedging
+        const hedgingOdds = liveFootballService.calculateHedgingOdds(liveOdds, matchStatus, selectedOptions);
+
+        // Mettre à jour les options avec les cotes actuelles
+        const updatedOptions = selectedOptions.map(opt => {
+            const currentOdds = liveFootballService.findLiveOddsForOption(
+                opt.option,
+                opt.odds || opt.originalOdds,
+                liveOdds,
+                matchStatus
+            );
+
+            const oddsChange = liveFootballService.detectOddsChanges(opt.odds, currentOdds);
+
+            return {
+                ...opt,
+                originalOdds: opt.odds,
+                currentOdds,
+                oddsChange
+            };
+        });
+
+        res.json({
+            hedgingOdds,
+            updatedOptions,
+            liveOdds: {
+                bookmaker: liveOdds.bookmaker,
+                isLive: liveOdds.isLive,
+                source: liveOdds.source,
+                update: liveOdds.update
+            },
+            matchStatus: {
+                score: matchStatus?.score,
+                elapsed: matchStatus?.elapsed,
+                status: matchStatus?.status
+            },
+            fetchedAt: new Date().toISOString()
+        });
+
+    } catch (error) {
+        console.error("Error fetching hedging odds:", error);
+        res.status(500).json({ error: "Failed to fetch hedging odds", details: error.message });
     }
 });
 
