@@ -2078,18 +2078,38 @@ app.post('/api/hedging/ai-optimize', authMiddleware, async (req, res) => {
         console.log('🧠 AI HEDGING OPTIMIZATION - Starting Analysis');
         console.log('═'.repeat(60));
         console.log(`📊 Initial bets: ${initialBets?.length || 0}`);
+        console.log(`📊 Initial bets data:`, JSON.stringify(initialBets, null, 2));
         console.log(`⚽ Score: ${currentScore?.home || 0} - ${currentScore?.away || 0}`);
         console.log(`⏱️  Elapsed: ${elapsed || 45}' | Remaining: ${90 - (elapsed || 45)}'`);
 
         // Validation des données
         if (!initialBets || initialBets.length === 0) {
-            return res.status(400).json({ error: "Les mises initiales sont requises" });
+            return res.status(400).json({ 
+                error: "Les mises initiales sont requises",
+                isOptimalFound: false,
+                metrics: { bestCase: 0, worstCase: 0, actualRatio: 0 }
+            });
         }
 
-        // Calculs de base
-        const totalInvested = initialBets.reduce((sum, b) => sum + (b.stake || 0), 0);
-        const totalPotentialReturn = initialBets.reduce((sum, b) => 
-            sum + Math.round((b.stake || 0) * (b.odds || 1.5)), 0);
+        // Normaliser et valider les paris initiaux
+        const validBets = initialBets.map(b => ({
+            option: String(b.option || 'Pari'),
+            stake: Number(b.stake) || 0,
+            odds: Number(b.odds) || 1.5
+        })).filter(b => b.stake > 0);
+
+        if (validBets.length === 0) {
+            return res.status(400).json({ 
+                error: "Aucune mise valide trouvée (stake > 0 requis)",
+                isOptimalFound: false,
+                metrics: { bestCase: 0, worstCase: 0, actualRatio: 0 }
+            });
+        }
+
+        // Calculs de base avec les paris validés
+        const totalInvested = validBets.reduce((sum, b) => sum + b.stake, 0);
+        const totalPotentialReturn = validBets.reduce((sum, b) => 
+            sum + Math.round(b.stake * b.odds), 0);
         const totalPotentialProfit = totalPotentialReturn - totalInvested;
         const targetRatio = minGainLossRatio || 1.5;
 
@@ -2268,7 +2288,9 @@ app.post('/api/hedging/calculate-breakeven-manual', authMiddleware, async (req, 
 
         console.log('\n📊 MANUAL BREAK-EVEN CALCULATION');
         console.log(`   Initial bets: ${initialBets?.length || 0}`);
+        console.log(`   Initial bets data:`, JSON.stringify(initialBets, null, 2));
         console.log(`   Hedge options: ${hedgeOptions?.length || 0}`);
+        console.log(`   Hedge options data:`, JSON.stringify(hedgeOptions, null, 2));
 
         // Validation
         if (!initialBets || initialBets.length === 0) {
@@ -2278,10 +2300,21 @@ app.post('/api/hedging/calculate-breakeven-manual', authMiddleware, async (req, 
             return res.status(400).json({ error: "Les options de couverture avec leurs cotes sont requises" });
         }
 
-        // Calculs de base
-        const totalInvested = initialBets.reduce((sum, b) => sum + (b.stake || 0), 0);
-        const totalPotentialReturn = initialBets.reduce((sum, b) => 
-            sum + Math.round((b.stake || 0) * (b.odds || 1)), 0);
+        // Normaliser et valider les paris initiaux
+        const validInitialBets = initialBets.map(b => ({
+            option: String(b.option || 'Pari'),
+            stake: Number(b.stake) || 0,
+            odds: Number(b.odds) || 1.5
+        })).filter(b => b.stake > 0);
+
+        if (validInitialBets.length === 0) {
+            return res.status(400).json({ error: "Aucune mise valide trouvée (stake > 0 requis)" });
+        }
+
+        // Calculs de base avec les paris validés
+        const totalInvested = validInitialBets.reduce((sum, b) => sum + b.stake, 0);
+        const totalPotentialReturn = validInitialBets.reduce((sum, b) => 
+            sum + Math.round(b.stake * b.odds), 0);
         const totalPotentialProfit = totalPotentialReturn - totalInvested;
 
         console.log(`💰 Total investi: ${totalInvested.toLocaleString()} FCFA`);
