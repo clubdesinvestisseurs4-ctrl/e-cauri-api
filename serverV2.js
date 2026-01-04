@@ -2050,6 +2050,651 @@ app.post('/api/hedging/apply', authMiddleware, async (req, res) => {
     }
 });
 
+// ========== NOUVELLE ROUTE: OPTIMISATION IA DU HEDGING ==========
+/**
+ * POST /api/hedging/ai-optimize
+ * 
+ * Analyse IA pour trouver la stratégie de couverture OPTIMALE
+ * Objectif: Maximiser gains (meilleur cas) / Minimiser pertes (pire cas)
+ * Règle: Le gain potentiel doit être AU MOINS 1.5x supérieur à la perte potentielle
+ * 
+ * Si aucune stratégie optimale n'est trouvée, retourne isOptimalFound: false
+ * pour que l'utilisateur puisse utiliser le calcul break-even manuel
+ */
+app.post('/api/hedging/ai-optimize', authMiddleware, async (req, res) => {
+    try {
+        const { 
+            predictionId,
+            initialBets,      // [{option, stake, odds}]
+            cashoutValues,    // {option: value} - Valeurs de cashout disponibles
+            liveOdds,         // Cotes en direct pour les options de hedge
+            matchEvents,      // Événements du match (buts, cartons, etc.)
+            currentScore,     // {home, away}
+            elapsed,          // Minutes jouées
+            minGainLossRatio  // Ratio minimum gain/perte souhaité (default: 1.5)
+        } = req.body;
+
+        console.log('\n' + '═'.repeat(60));
+        console.log('🧠 AI HEDGING OPTIMIZATION - Starting Analysis');
+        console.log('═'.repeat(60));
+        console.log(`📊 Initial bets: ${initialBets?.length || 0}`);
+        console.log(`⚽ Score: ${currentScore?.home || 0} - ${currentScore?.away || 0}`);
+        console.log(`⏱️  Elapsed: ${elapsed || 45}' | Remaining: ${90 - (elapsed || 45)}'`);
+
+        // Validation des données
+        if (!initialBets || initialBets.length === 0) {
+            return res.status(400).json({ error: "Les mises initiales sont requises" });
+        }
+
+        // Calculs de base
+        const totalInvested = initialBets.reduce((sum, b) => sum + (b.stake || 0), 0);
+        const totalPotentialReturn = initialBets.reduce((sum, b) => 
+            sum + Math.round((b.stake || 0) * (b.odds || 1.5)), 0);
+        const totalPotentialProfit = totalPotentialReturn - totalInvested;
+        const targetRatio = minGainLossRatio || 1.5;
+
+        console.log(`💰 Total investi: ${totalInvested.toLocaleString()} FCFA`);
+        console.log(`📈 Profit potentiel: ${totalPotentialProfit.toLocaleString()} FCFA`);
+        console.log(`🎯 Ratio cible: ${targetRatio}x`);
+
+        // Construire le prompt pour l'IA
+        const aiPrompt = buildHedgingAIPrompt({
+            initialBets,
+            cashoutValues,
+            liveOdds,
+            matchEvents,
+            currentScore,
+            elapsed,
+            totalInvested,
+            totalPotentialProfit,
+            targetRatio
+        });
+
+        let aiAnalysis = null;
+        let optimalStrategy = null;
+        let isOptimalFound = false;
+        let aiReasoning = "";
+        let usedEngine = "calculated";
+
+        // ========== APPEL IA (Claude ou DeepSeek) ==========
+        if (process.env.ANTHROPIC_API_KEY || process.env.DEEPSEEK_API_KEY) {
+            try {
+                // Essayer Claude d'abord (Extended Thinking pour meilleur raisonnement)
+                if (process.env.ANTHROPIC_API_KEY) {
+                    console.log('🤖 Calling Claude (Extended Thinking) for hedging optimization...');
+                    aiAnalysis = await callClaudeForHedging(aiPrompt, process.env.ANTHROPIC_API_KEY);
+                    usedEngine = "claude";
+                } 
+                // Sinon DeepSeek (Reasoner)
+                else if (process.env.DEEPSEEK_API_KEY) {
+                    console.log('🔮 Calling DeepSeek (Reasoner) for hedging optimization...');
+                    aiAnalysis = await callDeepSeek(
+                        aiPrompt,
+                        process.env.DEEPSEEK_API_KEY,
+                        "Tu es un expert mathématicien spécialisé dans les stratégies de couverture (hedging) pour les paris sportifs. Ton objectif est de trouver la combinaison OPTIMALE qui maximise les gains tout en minimisant les pertes.",
+                        true
+                    );
+                    usedEngine = "deepseek";
+                }
+
+                if (aiAnalysis) {
+                    console.log(`✅ AI Analysis received from ${usedEngine}`);
+                    optimalStrategy = aiAnalysis.optimalStrategy;
+                    isOptimalFound = aiAnalysis.isOptimalFound || false;
+                    aiReasoning = aiAnalysis._reasoning || aiAnalysis.reasoning || "";
+                }
+            } catch (aiError) {
+                console.error('⚠️ AI hedging analysis failed:', aiError.message);
+                console.log('📊 Falling back to calculated strategy...');
+            }
+        }
+
+        // ========== FALLBACK: CALCUL LOCAL SI IA NON DISPONIBLE ==========
+        if (!optimalStrategy) {
+            console.log('📊 Using local calculation for optimal strategy...');
+            const localResult = calculateOptimalHedgingLocal({
+                initialBets,
+                cashoutValues,
+                liveOdds,
+                currentScore,
+                elapsed,
+                totalInvested,
+                totalPotentialProfit,
+                targetRatio
+            });
+            optimalStrategy = localResult.strategy;
+            isOptimalFound = localResult.isOptimal;
+            usedEngine = "calculated";
+        }
+
+        // ========== CALCULER LE RATIO GAIN/PERTE ==========
+        const bestCase = optimalStrategy?.bestCase || totalPotentialProfit;
+        const worstCase = optimalStrategy?.worstCase || -totalInvested;
+        const actualRatio = worstCase !== 0 ? Math.abs(bestCase / worstCase) : 0;
+
+        // Vérifier si la stratégie respecte le ratio minimum
+        const meetsRatioTarget = actualRatio >= targetRatio && worstCase > -totalInvested;
+
+        console.log('\n📊 OPTIMIZATION RESULT:');
+        console.log(`   Best case: ${bestCase >= 0 ? '+' : ''}${bestCase.toLocaleString()} FCFA`);
+        console.log(`   Worst case: ${worstCase >= 0 ? '+' : ''}${worstCase.toLocaleString()} FCFA`);
+        console.log(`   Actual ratio: ${actualRatio.toFixed(2)}x (target: ${targetRatio}x)`);
+        console.log(`   Optimal found: ${meetsRatioTarget ? '✅ YES' : '❌ NO'}`);
+
+        // ========== CONSTRUIRE LA RÉPONSE ==========
+        const response = {
+            success: true,
+            analysis: {
+                totalInvested,
+                totalPotentialProfit,
+                currentScore,
+                elapsed,
+                timeRemaining: 90 - (elapsed || 0),
+                targetRatio
+            },
+            
+            // Stratégie optimale (si trouvée)
+            optimalStrategy: meetsRatioTarget ? optimalStrategy : null,
+            isOptimalFound: meetsRatioTarget,
+            
+            // Métriques de la stratégie
+            metrics: {
+                bestCase,
+                worstCase,
+                actualRatio: parseFloat(actualRatio.toFixed(2)),
+                meetsTarget: meetsRatioTarget,
+                expectedValue: optimalStrategy?.expectedValue || Math.round((bestCase + worstCase) / 2)
+            },
+            
+            // Message pour l'utilisateur
+            fallbackAvailable: !meetsRatioTarget,
+            fallbackMessage: !meetsRatioTarget 
+                ? `Aucune stratégie avec ratio ≥ ${targetRatio}x trouvée. Utilisez le calculateur Break-even pour minimiser vos pertes.`
+                : null,
+            
+            // Détails de l'analyse
+            aiReasoning: aiReasoning,
+            usedEngine,
+            
+            // Scénarios détaillés
+            scenarios: optimalStrategy?.scenarios || [],
+            hedgeBets: optimalStrategy?.hedgeBets || [],
+            
+            // Stratégies alternatives si disponibles
+            alternativeStrategies: aiAnalysis?.alternativeStrategies || [],
+            
+            generatedAt: new Date().toISOString()
+        };
+
+        // Log de l'action
+        if (firestoreService) {
+            try {
+                await firestoreService.logUserAction(req.user.uid, 'ai_hedging_optimize', {
+                    predictionId,
+                    totalInvested,
+                    isOptimalFound: meetsRatioTarget,
+                    actualRatio: parseFloat(actualRatio.toFixed(2)),
+                    usedEngine
+                }, { predictionId });
+            } catch (logError) {
+                console.warn('⚠️ Could not log action:', logError.message);
+            }
+        }
+
+        res.json(response);
+
+    } catch (error) {
+        console.error("❌ Error in AI hedging optimization:", error);
+        res.status(500).json({ 
+            error: "Échec de l'optimisation IA", 
+            details: error.message 
+        });
+    }
+});
+
+/**
+ * POST /api/hedging/calculate-breakeven-manual
+ * 
+ * Calcul MANUEL du seuil de rentabilité (break-even)
+ * L'utilisateur entre ses mises initiales et les cotes live des options opposées
+ * Le système calcule les mises exactes pour récupérer la mise initiale
+ */
+app.post('/api/hedging/calculate-breakeven-manual', authMiddleware, async (req, res) => {
+    try {
+        const { 
+            initialBets,      // [{option, stake, odds}] - Paris initiaux
+            hedgeOptions      // [{option, odds}] - Options de couverture avec cotes live
+        } = req.body;
+
+        console.log('\n📊 MANUAL BREAK-EVEN CALCULATION');
+        console.log(`   Initial bets: ${initialBets?.length || 0}`);
+        console.log(`   Hedge options: ${hedgeOptions?.length || 0}`);
+
+        // Validation
+        if (!initialBets || initialBets.length === 0) {
+            return res.status(400).json({ error: "Les mises initiales sont requises" });
+        }
+        if (!hedgeOptions || hedgeOptions.length === 0) {
+            return res.status(400).json({ error: "Les options de couverture avec leurs cotes sont requises" });
+        }
+
+        // Calculs de base
+        const totalInvested = initialBets.reduce((sum, b) => sum + (b.stake || 0), 0);
+        const totalPotentialReturn = initialBets.reduce((sum, b) => 
+            sum + Math.round((b.stake || 0) * (b.odds || 1)), 0);
+        const totalPotentialProfit = totalPotentialReturn - totalInvested;
+
+        console.log(`💰 Total investi: ${totalInvested.toLocaleString()} FCFA`);
+        console.log(`📈 Profit potentiel: ${totalPotentialProfit.toLocaleString()} FCFA`);
+
+        // ========== CALCUL DES MISES DE HEDGE ==========
+        const hedgeBets = [];
+        let totalHedgeStake = 0;
+
+        hedgeOptions.forEach((hedge) => {
+            const hedgeOdds = parseFloat(hedge.odds) || 2.0;
+            
+            if (hedgeOdds <= 1) {
+                console.warn(`⚠️ Invalid odds for ${hedge.option}: ${hedgeOdds}`);
+                return;
+            }
+            
+            // Formule break-even: hedgeStake = totalInvested / (hedgeOdds - 1)
+            // Cela garantit que si le hedge gagne, on récupère exactement la mise initiale
+            const hedgeStake = Math.ceil(totalInvested / (hedgeOdds - 1));
+            const hedgeReturn = Math.round(hedgeStake * hedgeOdds);
+            const netIfHedgeWins = hedgeReturn - totalInvested - hedgeStake;
+            
+            hedgeBets.push({
+                option: hedge.option,
+                odds: hedgeOdds,
+                stake: hedgeStake,
+                potentialReturn: hedgeReturn,
+                netResult: netIfHedgeWins,
+                formula: `${totalInvested} ÷ (${hedgeOdds.toFixed(2)} - 1) = ${hedgeStake}`
+            });
+            
+            totalHedgeStake += hedgeStake;
+        });
+
+        // ========== OPTIMISATION: TROUVER LA MEILLEURE OPTION ==========
+        // Si plusieurs options de hedge, choisir celle qui nécessite le moins de capital
+        let optimizedHedgeBets = hedgeBets;
+        let recommendedHedge = null;
+        
+        if (hedgeBets.length > 1) {
+            // Trier par mise requise (croissant)
+            const sorted = [...hedgeBets].sort((a, b) => a.stake - b.stake);
+            recommendedHedge = sorted[0];
+            optimizedHedgeBets = sorted;
+            totalHedgeStake = recommendedHedge.stake;
+        } else if (hedgeBets.length === 1) {
+            recommendedHedge = hedgeBets[0];
+        }
+
+        // ========== CALCUL DES SCÉNARIOS ==========
+        const scenarios = [];
+        
+        // Scénario 1: Le pari initial gagne
+        const profitIfInitialWins = totalPotentialProfit - totalHedgeStake;
+        scenarios.push({
+            name: "✅ Pari initial gagne",
+            description: "Vos paris originaux sont gagnants",
+            result: profitIfInitialWins,
+            calculation: `${totalPotentialProfit.toLocaleString()} - ${totalHedgeStake.toLocaleString()} = ${profitIfInitialWins >= 0 ? '+' : ''}${profitIfInitialWins.toLocaleString()} FCFA`,
+            probability: null // À déterminer selon le contexte
+        });
+        
+        // Scénario 2: Le hedge gagne
+        if (recommendedHedge) {
+            scenarios.push({
+                name: "🛡️ Hedge gagne",
+                description: "Le pari de couverture est gagnant",
+                result: recommendedHedge.netResult,
+                calculation: `${recommendedHedge.potentialReturn.toLocaleString()} - ${totalInvested.toLocaleString()} - ${recommendedHedge.stake.toLocaleString()} = ${recommendedHedge.netResult >= 0 ? '+' : ''}${recommendedHedge.netResult.toLocaleString()} FCFA`,
+                probability: null
+            });
+        }
+
+        const worstCase = Math.min(profitIfInitialWins, recommendedHedge?.netResult || -totalInvested);
+        const bestCase = Math.max(profitIfInitialWins, recommendedHedge?.netResult || 0);
+        const isBreakEven = worstCase >= -100; // Tolérance de 100 FCFA
+
+        // ========== CONSTRUIRE LA RÉPONSE ==========
+        const response = {
+            success: true,
+            breakEvenStrategy: {
+                name: "🎯 BREAK-EVEN STRATEGY",
+                description: isBreakEven 
+                    ? "Récupérer la mise initiale quel que soit le résultat"
+                    : "Minimiser les pertes au maximum",
+                
+                // Données d'entrée
+                totalInvested,
+                totalPotentialProfit,
+                
+                // Hedge recommandé
+                recommendedHedge,
+                allHedgeOptions: optimizedHedgeBets,
+                
+                // Capital requis
+                totalHedgeStake,
+                totalCapitalNeeded: totalInvested + totalHedgeStake,
+                
+                // Scénarios
+                scenarios,
+                
+                // Résultats
+                worstCase,
+                bestCase,
+                isBreakEven,
+                
+                // Recommandation
+                recommendation: isBreakEven 
+                    ? "✅ Cette stratégie vous permet de sortir sans perte"
+                    : `⚠️ Perte maximale limitée à ${Math.abs(worstCase).toLocaleString()} FCFA`
+            },
+            
+            // Formule expliquée
+            formula: {
+                description: "Formule du break-even",
+                formula: "Mise_hedge = Mise_initiale ÷ (Cote_hedge - 1)",
+                example: recommendedHedge 
+                    ? `${totalInvested.toLocaleString()} ÷ (${recommendedHedge.odds.toFixed(2)} - 1) = ${recommendedHedge.stake.toLocaleString()} FCFA`
+                    : null
+            },
+            
+            generatedAt: new Date().toISOString()
+        };
+
+        // Log de l'action
+        if (firestoreService) {
+            try {
+                await firestoreService.logUserAction(req.user.uid, 'calculate_breakeven_manual', {
+                    totalInvested,
+                    totalHedgeStake,
+                    worstCase,
+                    bestCase,
+                    isBreakEven
+                });
+            } catch (logError) {
+                console.warn('⚠️ Could not log action:', logError.message);
+            }
+        }
+
+        console.log(`\n✅ Break-even calculation complete:`);
+        console.log(`   Hedge stake: ${totalHedgeStake.toLocaleString()} FCFA`);
+        console.log(`   Best case: ${bestCase >= 0 ? '+' : ''}${bestCase.toLocaleString()} FCFA`);
+        console.log(`   Worst case: ${worstCase >= 0 ? '+' : ''}${worstCase.toLocaleString()} FCFA`);
+
+        res.json(response);
+
+    } catch (error) {
+        console.error("❌ Error calculating break-even:", error);
+        res.status(500).json({ 
+            error: "Échec du calcul break-even", 
+            details: error.message 
+        });
+    }
+});
+
+// ========== FONCTIONS HELPER POUR LE HEDGING IA ==========
+
+/**
+ * Construit le prompt pour l'analyse IA du hedging
+ */
+function buildHedgingAIPrompt(data) {
+    const { initialBets, cashoutValues, liveOdds, matchEvents, currentScore, elapsed, totalInvested, totalPotentialProfit, targetRatio } = data;
+    
+    return `
+# ANALYSE DE COUVERTURE (HEDGING) - MI-TEMPS
+
+## CONTEXTE DU MATCH
+- Score actuel: ${currentScore?.home || 0} - ${currentScore?.away || 0}
+- Temps joué: ${elapsed || 45} minutes
+- Temps restant: ${90 - (elapsed || 45)} minutes
+
+## MES PARIS INITIAUX
+${initialBets.map((b, i) => `${i + 1}. ${b.option}: ${b.stake?.toLocaleString()} FCFA @ ${b.odds}`).join('\n')}
+
+**Total investi:** ${totalInvested?.toLocaleString()} FCFA
+**Profit potentiel si tout gagne:** ${totalPotentialProfit?.toLocaleString()} FCFA
+
+## CASHOUTS DISPONIBLES
+${cashoutValues && Object.keys(cashoutValues).length > 0 
+    ? Object.entries(cashoutValues).map(([k, v]) => `- ${k}: ${v?.toLocaleString()} FCFA`).join('\n')
+    : 'Non disponibles'}
+
+## COTES EN DIRECT POUR HEDGING
+${liveOdds ? JSON.stringify(liveOdds, null, 2) : 'Utiliser estimation basée sur le score'}
+
+## ÉVÉNEMENTS DU MATCH
+${matchEvents ? JSON.stringify(matchEvents, null, 2) : 'Aucun événement notable'}
+
+## OBJECTIF DE L'OPTIMISATION
+Trouver la MEILLEURE stratégie de couverture où:
+1. **Ratio gain/perte ≥ ${targetRatio}x** : Le gain potentiel (meilleur cas) doit être AU MOINS ${targetRatio} fois supérieur à la perte potentielle (pire cas)
+2. **Minimiser les pertes** : Dans le pire scénario, les pertes doivent être réduites au minimum
+3. **Capital raisonnable** : La mise de couverture ne doit pas être excessive
+
+## TYPES DE STRATÉGIES À CONSIDÉRER
+1. **Hedge simple** : Miser sur l'option opposée
+2. **Hedge partiel** : Couvrir seulement une partie
+3. **Cashout partiel + Hedge** : Combiner cashout et nouvelle mise
+4. **Multi-hedge** : Couvrir plusieurs scénarios
+
+## FORMAT DE RÉPONSE (JSON STRICT)
+{
+    "isOptimalFound": true/false,
+    "optimalStrategy": {
+        "name": "Nom de la stratégie",
+        "type": "hedge_simple|hedge_partial|cashout_hedge|multi_hedge",
+        "description": "Description claire",
+        "hedgeBets": [
+            {"option": "Option à parier", "stake": montant_en_FCFA, "odds": cote}
+        ],
+        "totalCapitalNeeded": montant_total_hedge,
+        "scenarios": [
+            {"name": "Scénario 1", "probability": 0.XX, "result": montant_FCFA, "description": "Explication"},
+            {"name": "Scénario 2", "probability": 0.XX, "result": montant_FCFA, "description": "Explication"}
+        ],
+        "bestCase": montant_meilleur_cas,
+        "worstCase": montant_pire_cas,
+        "expectedValue": valeur_esperee,
+        "recommendation": "Explication de pourquoi cette stratégie"
+    },
+    "reasoning": "Explication détaillée du raisonnement",
+    "alternativeStrategies": []
+}
+
+IMPORTANT: Si aucune stratégie ne respecte le ratio ${targetRatio}x, retourne isOptimalFound: false avec une explication.
+`;
+}
+
+/**
+ * Appelle Claude API avec Extended Thinking pour l'analyse de hedging
+ */
+async function callClaudeForHedging(prompt, apiKey) {
+    const fetch = (await import('node-fetch')).default;
+    
+    try {
+        const response = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01'
+            },
+            body: JSON.stringify({
+                model: 'claude-sonnet-4-20250514',
+                max_tokens: 16000,
+                thinking: {
+                    type: "enabled",
+                    budget_tokens: 10000
+                },
+                messages: [{
+                    role: 'user',
+                    content: prompt
+                }]
+            })
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Claude API error: ${response.status} - ${errorText}`);
+        }
+
+        const data = await response.json();
+        let content = '';
+        let reasoning = '';
+
+        // Extraire le contenu et le raisonnement
+        for (const block of data.content || []) {
+            if (block.type === 'thinking') {
+                reasoning = block.thinking;
+            } else if (block.type === 'text') {
+                content = block.text;
+            }
+        }
+
+        // Parser le JSON
+        try {
+            const cleanContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+            const parsed = JSON.parse(cleanContent);
+            parsed._reasoning = reasoning;
+            return parsed;
+        } catch (parseError) {
+            console.warn('⚠️ Could not parse Claude response as JSON:', parseError.message);
+            return { 
+                isOptimalFound: false, 
+                rawResponse: content, 
+                _reasoning: reasoning,
+                error: "Response parsing failed"
+            };
+        }
+    } catch (error) {
+        console.error('❌ Claude API call failed:', error.message);
+        throw error;
+    }
+}
+
+/**
+ * Calcul local de la stratégie optimale (fallback si IA non disponible)
+ */
+function calculateOptimalHedgingLocal(data) {
+    const { initialBets, liveOdds, currentScore, elapsed, totalInvested, totalPotentialProfit, targetRatio } = data;
+    
+    // Estimer les cotes de hedge basées sur le type de pari
+    const hedgeScenarios = [];
+    
+    initialBets.forEach(bet => {
+        const optLower = (bet.option || '').toLowerCase();
+        let hedgeOption = "";
+        let hedgeOdds = 2.0;
+        
+        // Déterminer l'option opposée et estimer la cote
+        if (optLower.includes('plus de') || optLower.includes('over') || optLower.includes('+')) {
+            const line = optLower.match(/[\d.]+/)?.[0] || '2.5';
+            hedgeOption = `Moins de ${line} buts`;
+            // Estimer la cote basée sur le score actuel
+            const totalGoals = (currentScore?.home || 0) + (currentScore?.away || 0);
+            hedgeOdds = totalGoals >= parseFloat(line) ? 5.0 : (totalGoals >= parseFloat(line) - 1 ? 2.5 : 1.6);
+        } else if (optLower.includes('moins de') || optLower.includes('under') || optLower.includes('-')) {
+            const line = optLower.match(/[\d.]+/)?.[0] || '2.5';
+            hedgeOption = `Plus de ${line} buts`;
+            const totalGoals = (currentScore?.home || 0) + (currentScore?.away || 0);
+            hedgeOdds = totalGoals === 0 ? 3.5 : (totalGoals === 1 ? 2.0 : 1.4);
+        } else if (optLower.includes('btts oui') || optLower.includes('deux équipes marquent')) {
+            hedgeOption = "BTTS Non";
+            const bothScored = (currentScore?.home || 0) > 0 && (currentScore?.away || 0) > 0;
+            hedgeOdds = bothScored ? 10.0 : 1.8;
+        } else if (optLower.includes('victoire')) {
+            hedgeOption = "Double Chance opposée";
+            hedgeOdds = 1.5;
+        } else {
+            hedgeOption = "Pari opposé";
+            hedgeOdds = 2.0;
+        }
+        
+        // Utiliser les cotes live si disponibles
+        if (liveOdds) {
+            // Chercher la cote correspondante
+            const goals = liveOdds.goals || {};
+            if (hedgeOption.includes('Moins de') && goals.under) {
+                const line = hedgeOption.match(/[\d.]+/)?.[0] || '2.5';
+                hedgeOdds = goals.under[line] || hedgeOdds;
+            } else if (hedgeOption.includes('Plus de') && goals.over) {
+                const line = hedgeOption.match(/[\d.]+/)?.[0] || '2.5';
+                hedgeOdds = goals.over[line] || hedgeOdds;
+            } else if (hedgeOption === 'BTTS Non' && liveOdds.bttsNo) {
+                hedgeOdds = liveOdds.bttsNo;
+            }
+        }
+        
+        hedgeScenarios.push({
+            originalBet: bet,
+            hedgeOption,
+            hedgeOdds
+        });
+    });
+    
+    // Calculer la meilleure stratégie
+    let bestStrategy = null;
+    let bestRatio = 0;
+    
+    // Stratégie 1: Break-even simple
+    const avgHedgeOdds = hedgeScenarios.reduce((sum, s) => sum + s.hedgeOdds, 0) / hedgeScenarios.length;
+    const hedgeStakeBreakEven = Math.ceil(totalInvested / (avgHedgeOdds - 1));
+    const profitIfWin = totalPotentialProfit - hedgeStakeBreakEven;
+    const profitIfHedge = Math.round(hedgeStakeBreakEven * avgHedgeOdds) - totalInvested - hedgeStakeBreakEven;
+    
+    const worstCase = Math.min(profitIfWin, profitIfHedge);
+    const bestCase = Math.max(profitIfWin, profitIfHedge);
+    const ratio = worstCase !== 0 ? Math.abs(bestCase / worstCase) : 0;
+    
+    if (ratio > bestRatio) {
+        bestRatio = ratio;
+        bestStrategy = {
+            name: "🎯 HEDGE BREAK-EVEN",
+            type: "hedge_simple",
+            description: `Couvrir pour récupérer la mise initiale`,
+            hedgeBets: hedgeScenarios.map(s => ({
+                option: s.hedgeOption,
+                stake: Math.ceil(s.originalBet.stake / (s.hedgeOdds - 1)),
+                odds: s.hedgeOdds
+            })),
+            totalCapitalNeeded: hedgeStakeBreakEven,
+            scenarios: [
+                {
+                    name: "✅ Pari initial gagne",
+                    probability: 0.5,
+                    result: profitIfWin,
+                    description: `${totalPotentialProfit.toLocaleString()} - ${hedgeStakeBreakEven.toLocaleString()} = ${profitIfWin.toLocaleString()} FCFA`
+                },
+                {
+                    name: "🛡️ Hedge gagne",
+                    probability: 0.5,
+                    result: profitIfHedge,
+                    description: `Récupération via hedge`
+                }
+            ],
+            bestCase,
+            worstCase,
+            expectedValue: Math.round((profitIfWin + profitIfHedge) / 2),
+            recommendation: ratio >= targetRatio 
+                ? "Stratégie optimale trouvée" 
+                : "Ratio inférieur à la cible"
+        };
+    }
+    
+    const isOptimal = bestRatio >= targetRatio && worstCase >= 0;
+    
+    return {
+        isOptimal,
+        strategy: bestStrategy
+    };
+}
+
 // ========== FONCTION AVANCÉE DE CALCUL DE STRATÉGIES DE COUVERTURE ==========
 /**
  * Calcule 4 stratégies de couverture optimisées:
