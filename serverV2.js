@@ -226,11 +226,14 @@ async function sendNotificationToUser(userId, notification) {
 /**
  * Appel à l'API DeepSeek avec mode Reasoner (Thinking)
  * Utilise deepseek-reasoner pour une analyse avec raisonnement profond
+ * Avec système de retry robuste et timeout adaptatif
  */
 const DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions";
+const DEEPSEEK_TIMEOUT = 60000; // 60 secondes timeout (réduit pour détecter plus vite les problèmes)
+const DEEPSEEK_MAX_RETRIES = 2; // Réduit à 2 pour ne pas bloquer trop longtemps
 
-async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = true) {
-    console.log("🔮 Calling DeepSeek API with Reasoning...");
+async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = true, retryCount = 0) {
+    console.log(`🔮 Calling DeepSeek API${useReasoner ? ' (Reasoner)' : ' (Chat)'}... ${retryCount > 0 ? `(Retry ${retryCount}/${DEEPSEEK_MAX_RETRIES})` : ''}`);
     
     if (!apiKey) {
         throw new Error("DeepSeek API key not provided");
@@ -249,6 +252,13 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = tru
         max_tokens: 8000
     };
 
+    // Controller pour le timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        console.log(`⏰ DeepSeek timeout after ${DEEPSEEK_TIMEOUT/1000}s`);
+        controller.abort();
+    }, DEEPSEEK_TIMEOUT);
+
     try {
         const fetch = (await import('node-fetch')).default;
         
@@ -256,10 +266,15 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = tru
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`
+                "Authorization": `Bearer ${apiKey}`,
+                "Connection": "keep-alive" // Garder la connexion ouverte
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
+            signal: controller.signal,
+            timeout: DEEPSEEK_TIMEOUT // Double sécurité
         });
+
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
             const errorText = await response.text();
@@ -267,7 +282,15 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = tru
             // Si le reasoner n'est pas supporté, réessayer avec chat
             if (response.status === 400 && useReasoner) {
                 console.log("⚠️ DeepSeek Reasoner not available, retrying with chat model...");
-                return callDeepSeek(prompt, apiKey, systemPrompt, false);
+                return callDeepSeek(prompt, apiKey, systemPrompt, false, 0);
+            }
+            
+            // Erreurs 5xx sont retryables
+            if (response.status >= 500 && retryCount < DEEPSEEK_MAX_RETRIES) {
+                const delay = Math.min(2000 * Math.pow(2, retryCount), 8000);
+                console.log(`⏳ Server error ${response.status}, retrying in ${delay/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return callDeepSeek(prompt, apiKey, systemPrompt, useReasoner, retryCount + 1);
             }
             
             throw new Error(`DeepSeek API error: ${response.status} - ${errorText}`);
@@ -311,7 +334,45 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = "", useReasoner = tru
         }
 
     } catch (error) {
-        console.error("❌ DeepSeek API Error:", error.message);
+        clearTimeout(timeoutId);
+        
+        // Identifier si l'erreur est retryable
+        const errorMessage = error.message || String(error);
+        const errorCause = error.cause?.code || '';
+        
+        const isRetryable = 
+            error.name === 'AbortError' || 
+            errorMessage.includes('terminated') ||
+            errorMessage.includes('ECONNRESET') ||
+            errorMessage.includes('ECONNREFUSED') ||
+            errorMessage.includes('socket') ||
+            errorMessage.includes('network') ||
+            errorMessage.includes('other side closed') ||
+            errorMessage.includes('fetch failed') ||
+            errorCause === 'UND_ERR_SOCKET' ||
+            errorCause === 'ECONNRESET';
+        
+        console.error(`❌ DeepSeek API Error: ${errorMessage}${isRetryable ? ' (retryable)' : ''}`);
+        
+        // Retry si erreur de connexion et pas trop de retries
+        if (isRetryable && retryCount < DEEPSEEK_MAX_RETRIES) {
+            const delay = Math.min(2000 * Math.pow(2, retryCount), 8000); // Exponential backoff
+            console.log(`⏳ Connection error, waiting ${delay/1000}s before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return callDeepSeek(prompt, apiKey, systemPrompt, useReasoner, retryCount + 1);
+        }
+        
+        // Si reasoner échoue après tous les retries, essayer avec chat model une fois
+        if (useReasoner && retryCount >= DEEPSEEK_MAX_RETRIES) {
+            console.log("⚠️ DeepSeek Reasoner failed, trying with chat model as fallback...");
+            try {
+                return await callDeepSeek(prompt, apiKey, systemPrompt, false, 0);
+            } catch (chatError) {
+                console.error("❌ DeepSeek chat fallback also failed:", chatError.message);
+                throw error; // Throw original error
+            }
+        }
+        
         throw error;
     }
 }
@@ -558,6 +619,7 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
 
         // Lancer le pipeline de prédiction IA (Claude + DeepSeek avec Thinking)
         let prediction;
+        let aiErrorDetails = null;
         try {
             if (predictionService) {
                 console.log(`\n🧠 Using AI Engines:`);
@@ -575,12 +637,26 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
                 prediction = generateMockPrediction(matchData, userBalance, bookmaker);
             }
         } catch (aiError) {
-            // Si l'IA échoue, utiliser le mock
+            // Si l'IA échoue, utiliser le mock mais stocker l'erreur
             console.error("❌ AI prediction failed:", aiError.message);
             console.log("📦 Falling back to mock prediction");
+            
+            // Détails de l'erreur pour le frontend
+            aiErrorDetails = {
+                message: aiError.message,
+                type: aiError.name || 'AIError',
+                retryable: aiError.message?.includes('terminated') || 
+                          aiError.message?.includes('timeout') ||
+                          aiError.message?.includes('socket') ||
+                          aiError.message?.includes('network') ||
+                          aiError.message?.includes('ECONNRESET'),
+                timestamp: new Date().toISOString()
+            };
+            
             prediction = generateMockPrediction(matchData, userBalance, bookmaker);
-            prediction.aiError = aiError.message;
+            prediction.aiError = aiErrorDetails;
             prediction.isDemo = true;
+            prediction.canRetry = true;
         }
 
         // ========== STAKES: CALCUL DÉPLACÉ AU FRONTEND ==========
@@ -612,6 +688,8 @@ app.post('/api/predictions/analyze', authMiddleware, async (req, res) => {
             status: 'analyzed', // Analyse terminée, en attente de validation
             analyzedAt: new Date().toISOString(),
             isDemo: prediction.isDemo || false,
+            aiError: aiErrorDetails, // Erreur IA si présente
+            canRetry: prediction.canRetry || false, // Peut relancer l'analyse
             aiEngines: {
                 primary: "Claude (Extended Thinking)",
                 secondary: "DeepSeek (Reasoner)"
@@ -816,6 +894,157 @@ function getMockMatchData() {
         }
     };
 }
+
+/**
+ * POST /api/predictions/:id/retry
+ * Relance l'analyse IA pour une prédiction existante
+ * Utilisé quand l'analyse initiale a échoué
+ */
+app.post('/api/predictions/:id/retry', authMiddleware, async (req, res) => {
+    try {
+        const { id } = req.params;
+        console.log(`\n🔄 Retrying AI analysis for prediction ${id}`);
+        
+        // Récupérer la prédiction existante
+        let existingPrediction;
+        if (firestoreService) {
+            existingPrediction = await firestoreService.getPredictionById(id);
+        }
+        
+        if (!existingPrediction) {
+            return res.status(404).json({ 
+                error: "Prédiction non trouvée",
+                canRetry: false 
+            });
+        }
+        
+        // Vérifier que l'utilisateur est propriétaire
+        if (existingPrediction.userId !== req.user.uid) {
+            return res.status(403).json({ 
+                error: "Non autorisé",
+                canRetry: false 
+            });
+        }
+        
+        // Récupérer les données du match
+        const matchData = existingPrediction.matchInfo || {};
+        const userBalance = existingPrediction.userBalance || 10000;
+        const bookmaker = existingPrediction.bookmaker || 'default';
+        
+        // Récupérer les données complètes du match si possible
+        let fullMatchData = matchData;
+        if (firestoreService && matchData.fixtureId) {
+            try {
+                const opportunity = await firestoreService.getOpportunityById(matchData.fixtureId.toString());
+                if (opportunity) {
+                    fullMatchData = { ...opportunity, ...matchData };
+                }
+            } catch (e) {
+                console.warn("⚠️ Could not fetch full match data:", e.message);
+            }
+        }
+        
+        // Relancer l'analyse IA
+        let prediction;
+        let aiErrorDetails = null;
+        let retrySuccess = false;
+        
+        try {
+            if (predictionService) {
+                console.log(`🧠 Retrying with AI Engines...`);
+                
+                prediction = await predictionService.runFullPrediction(
+                    fullMatchData,
+                    userBalance,
+                    bookmaker
+                );
+                retrySuccess = true;
+                console.log(`✅ Retry successful!`);
+            } else {
+                throw new Error("AI service not configured");
+            }
+        } catch (aiError) {
+            console.error("❌ Retry failed:", aiError.message);
+            
+            aiErrorDetails = {
+                message: aiError.message,
+                type: aiError.name || 'AIError',
+                retryable: aiError.message?.includes('terminated') || 
+                          aiError.message?.includes('timeout') ||
+                          aiError.message?.includes('socket'),
+                timestamp: new Date().toISOString(),
+                retryAttempt: (existingPrediction.retryCount || 0) + 1
+            };
+            
+            // Mettre à jour avec l'erreur
+            if (firestoreService) {
+                await firestoreService.updatePrediction(id, {
+                    aiError: aiErrorDetails,
+                    canRetry: true,
+                    retryCount: (existingPrediction.retryCount || 0) + 1,
+                    lastRetryAt: new Date().toISOString()
+                });
+            }
+            
+            return res.status(500).json({
+                error: "L'analyse IA a échoué. Veuillez réessayer.",
+                aiError: aiErrorDetails,
+                canRetry: true,
+                retryCount: (existingPrediction.retryCount || 0) + 1
+            });
+        }
+        
+        // Mettre à jour la prédiction avec les nouvelles données
+        const updateData = {
+            aiAnalysis: prediction.matchAnalysis || null,
+            oddsAnalysis: prediction.oddsAnalysis || null,
+            synthesis: prediction.synthesis || null,
+            aiError: null, // Effacer l'erreur précédente
+            canRetry: false,
+            isDemo: false,
+            retrySuccessAt: new Date().toISOString(),
+            retryCount: (existingPrediction.retryCount || 0) + 1
+        };
+        
+        if (firestoreService) {
+            await firestoreService.updatePrediction(id, updateData);
+            
+            // Notifier l'utilisateur
+            try {
+                await sendNotificationToUser(req.user.uid, {
+                    type: 'retry_success',
+                    title: '✅ Analyse relancée avec succès',
+                    body: `L'analyse de ${matchData.homeTeam || 'Match'} vs ${matchData.awayTeam || ''} est maintenant complète.`,
+                    data: { predictionId: id }
+                });
+            } catch (e) {
+                console.warn("⚠️ Could not send notification:", e.message);
+            }
+        }
+        
+        console.log(`✅ Prediction ${id} updated with new AI analysis`);
+        
+        res.json({
+            success: true,
+            message: "Analyse relancée avec succès",
+            prediction: {
+                id,
+                ...existingPrediction,
+                ...updateData,
+                aiAnalysis: prediction.matchAnalysis,
+                oddsAnalysis: prediction.oddsAnalysis,
+                synthesis: prediction.synthesis
+            }
+        });
+        
+    } catch (error) {
+        console.error("❌ Retry error:", error.message);
+        res.status(500).json({ 
+            error: error.message,
+            canRetry: true 
+        });
+    }
+});
 
 /**
  * PUT /api/predictions/:id/select-options
@@ -1512,11 +1741,16 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
         // ========== APPEL CLAUDE + DEEPSEEK ==========
         let claudeAnalysis = null;
         let deepseekAnalysis = null;
+        let aiErrors = [];
         
         // 1. Appel Claude avec Extended Thinking
         if (predictionService && predictionService.claudeKey) {
             try {
                 console.log("🧠 Calling Claude (Extended Thinking) for hedging analysis...");
+                
+                // Controller pour timeout
+                const claudeController = new AbortController();
+                const claudeTimeout = setTimeout(() => claudeController.abort(), 120000); // 2 min timeout
                 
                 const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
                     method: 'POST',
@@ -1536,8 +1770,11 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                             role: 'user',
                             content: hedgingPrompt
                         }]
-                    })
+                    }),
+                    signal: claudeController.signal
                 });
+                
+                clearTimeout(claudeTimeout);
                 
                 if (claudeResponse.ok) {
                     const claudeData = await claudeResponse.json();
@@ -1550,9 +1787,17 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                             console.log("✅ Claude analysis completed");
                         }
                     }
+                } else {
+                    const errorText = await claudeResponse.text();
+                    throw new Error(`Claude API error: ${claudeResponse.status} - ${errorText}`);
                 }
             } catch (claudeError) {
                 console.warn("⚠️ Claude error:", claudeError.message);
+                aiErrors.push({
+                    engine: 'claude',
+                    message: claudeError.message,
+                    retryable: claudeError.name === 'AbortError' || claudeError.message?.includes('timeout')
+                });
             }
         }
         
@@ -1571,10 +1816,18 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
                 
             } catch (deepseekError) {
                 console.warn("⚠️ DeepSeek error:", deepseekError.message);
+                aiErrors.push({
+                    engine: 'deepseek',
+                    message: deepseekError.message,
+                    retryable: deepseekError.message?.includes('terminated') || 
+                              deepseekError.message?.includes('timeout') ||
+                              deepseekError.message?.includes('socket')
+                });
             }
         }
         
         // 3. Combiner ou utiliser le fallback calculé
+        let usedFallback = false;
         if (claudeAnalysis || deepseekAnalysis) {
             // Préférer Claude, fallback sur DeepSeek
             strategy = claudeAnalysis || deepseekAnalysis;
@@ -1591,6 +1844,19 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
             // Fallback: calcul mathématique local
             console.log("📊 Using calculated hedging strategies (fallback)...");
             strategy = generateAdvancedHedgingStrategies(optionsToAnalyze, currentScore, currentElapsed, safeCashouts, liveData, matchInfo);
+            usedFallback = true;
+        }
+        
+        // Ajouter les infos d'erreur IA à la stratégie
+        if (aiErrors.length > 0) {
+            strategy.aiErrors = aiErrors;
+            strategy.canRetry = aiErrors.some(e => e.retryable);
+            strategy.usedFallback = usedFallback;
+            if (usedFallback) {
+                strategy.warningMessage = "L'analyse IA a échoué. Les stratégies sont basées sur des calculs mathématiques locaux. Vous pouvez relancer l'analyse.";
+            } else {
+                strategy.warningMessage = `Analyse partielle: ${aiErrors.map(e => e.engine).join(' et ')} a échoué. Résultats basés sur ${strategy.engine}.`;
+            }
         }
 
         // Envoyer une notification
@@ -1638,22 +1904,261 @@ Réponds UNIQUEMENT en JSON valide avec cette structure:
 
     } catch (error) {
         console.error("❌ Error calculating hedging strategy:", error);
+        
+        // Déterminer si l'erreur est retryable
+        const errorMessage = error.message || String(error);
+        const isRetryable = 
+            errorMessage.includes('terminated') ||
+            errorMessage.includes('timeout') ||
+            errorMessage.includes('socket') ||
+            errorMessage.includes('network') ||
+            errorMessage.includes('ECONNRESET') ||
+            errorMessage.includes('fetch failed');
+        
         res.status(500).json({ 
-            error: "Failed to calculate hedging strategy", 
-            details: error.message,
+            error: "L'analyse de couverture a échoué", 
+            details: errorMessage,
+            canRetry: isRetryable,
+            retryMessage: isRetryable 
+                ? "Une erreur de connexion s'est produite. Vous pouvez relancer l'analyse."
+                : "Une erreur technique s'est produite. Veuillez réessayer plus tard.",
             // Renvoyer une stratégie de secours
             strategy: {
                 recommendation: "monitor",
                 confidence: 0.5,
-                analysis: "Une erreur s'est produite. Surveillez le match et prenez une décision manuelle.",
+                analysis: "Une erreur s'est produite lors de l'analyse IA. Vous pouvez utiliser le calculateur Break-even manuel ou relancer l'analyse.",
                 options: [],
-                summary: "Erreur technique - Décision manuelle recommandée",
+                summary: "⚠️ Erreur technique - Utilisez le calcul manuel ou relancez l'analyse",
                 isDemo: true,
-                error: true
+                error: true,
+                aiError: {
+                    message: errorMessage,
+                    retryable: isRetryable,
+                    timestamp: new Date().toISOString()
+                },
+                canRetry: isRetryable,
+                warningMessage: isRetryable 
+                    ? "L'analyse IA a échoué (erreur réseau). Cliquez sur 'Relancer' pour réessayer."
+                    : "L'analyse IA a échoué. Utilisez le calculateur Break-even manuel."
             }
         });
     }
 });
+
+/**
+ * POST /api/hedging/retry
+ * Relance l'analyse de couverture pour une prédiction
+ * Utilisé quand l'analyse initiale a échoué
+ */
+app.post('/api/hedging/retry', authMiddleware, async (req, res) => {
+    try {
+        const { predictionId, options, currentScore, currentElapsed, fixtureId, matchInfo } = req.body;
+        
+        console.log(`\n🔄 Retrying hedging analysis for prediction ${predictionId}`);
+        
+        if (!predictionId) {
+            return res.status(400).json({ 
+                error: "predictionId requis",
+                canRetry: false 
+            });
+        }
+        
+        // Récupérer la prédiction
+        let prediction;
+        if (firestoreService) {
+            prediction = await firestoreService.getPredictionById(predictionId);
+        }
+        
+        if (!prediction) {
+            return res.status(404).json({ 
+                error: "Prédiction non trouvée",
+                canRetry: false 
+            });
+        }
+        
+        // Vérifier l'utilisateur
+        if (prediction.userId !== req.user.uid) {
+            return res.status(403).json({ 
+                error: "Non autorisé",
+                canRetry: false 
+            });
+        }
+        
+        // Utiliser les données fournies ou celles de la prédiction
+        const optionsToAnalyze = options || prediction.selectedOptions || [];
+        const score = currentScore || { home: 0, away: 0 };
+        const elapsed = currentElapsed || 45;
+        const fixture = fixtureId || prediction.matchInfo?.fixtureId;
+        const match = matchInfo || prediction.matchInfo;
+        
+        console.log(`   Options: ${optionsToAnalyze.length}, Score: ${score.home}-${score.away}, Minute: ${elapsed}`);
+        
+        // Récupérer les données live si possible
+        let liveData = null;
+        if (fixture && liveFootballService) {
+            try {
+                liveData = await liveFootballService.getLiveOddsAndStats(fixture);
+            } catch (e) {
+                console.warn("⚠️ Could not fetch live data:", e.message);
+            }
+        }
+        
+        // Calculer les stratégies (avec retry interne)
+        let strategy;
+        let aiErrors = [];
+        
+        try {
+            // Essayer d'abord avec l'IA
+            if (predictionService && predictionService.claudeKey) {
+                console.log("🧠 Retry with Claude...");
+                
+                // Construire le prompt de hedging
+                const hedgingPrompt = buildHedgingPrompt(optionsToAnalyze, score, elapsed, liveData, match);
+                
+                const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-api-key': predictionService.claudeKey,
+                        'anthropic-version': '2023-06-01'
+                    },
+                    body: JSON.stringify({
+                        model: "claude-sonnet-4-20250514",
+                        max_tokens: 8000,
+                        messages: [{ role: "user", content: hedgingPrompt }]
+                    }),
+                    signal: AbortSignal.timeout(60000) // 60s timeout
+                });
+                
+                if (claudeResponse.ok) {
+                    const data = await claudeResponse.json();
+                    const content = data.content?.[0]?.text || '';
+                    const cleanContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                    strategy = JSON.parse(cleanContent);
+                    strategy.engine = 'claude';
+                    strategy.isDemo = false;
+                    console.log("✅ Claude retry successful");
+                } else {
+                    throw new Error(`Claude API error: ${claudeResponse.status}`);
+                }
+            }
+        } catch (claudeError) {
+            console.warn("⚠️ Claude retry failed:", claudeError.message);
+            aiErrors.push({
+                engine: 'claude',
+                message: claudeError.message,
+                retryable: true
+            });
+        }
+        
+        // Si Claude a échoué, essayer DeepSeek
+        if (!strategy && predictionService && predictionService.deepseekKey) {
+            try {
+                console.log("🧠 Trying DeepSeek as fallback...");
+                const hedgingPrompt = buildHedgingPrompt(optionsToAnalyze, score, elapsed, liveData, match);
+                strategy = await callDeepSeek(
+                    hedgingPrompt,
+                    predictionService.deepseekKey,
+                    "Expert en hedging sportif",
+                    true
+                );
+                strategy.engine = 'deepseek';
+                strategy.isDemo = false;
+                console.log("✅ DeepSeek fallback successful");
+            } catch (deepseekError) {
+                console.warn("⚠️ DeepSeek fallback failed:", deepseekError.message);
+                aiErrors.push({
+                    engine: 'deepseek',
+                    message: deepseekError.message,
+                    retryable: true
+                });
+            }
+        }
+        
+        // Si tout a échoué, utiliser le calcul local
+        if (!strategy) {
+            console.log("📊 Using local calculation as final fallback...");
+            strategy = generateAdvancedHedgingStrategies(
+                optionsToAnalyze, 
+                score, 
+                elapsed, 
+                {}, // Pas de cashouts
+                liveData, 
+                match
+            );
+            strategy.usedFallback = true;
+            strategy.warningMessage = "L'analyse IA a échoué après plusieurs tentatives. Stratégies basées sur calculs mathématiques.";
+        }
+        
+        // Ajouter les infos d'erreur si présentes
+        if (aiErrors.length > 0) {
+            strategy.aiErrors = aiErrors;
+            strategy.canRetry = true;
+        }
+        
+        // Mettre à jour la prédiction
+        if (firestoreService) {
+            await firestoreService.updatePrediction(predictionId, {
+                hedgingStrategy: strategy,
+                lastHedgingAt: new Date().toISOString(),
+                hedgingRetryCount: (prediction.hedgingRetryCount || 0) + 1
+            });
+            
+            // Notifier
+            await sendNotificationToUser(req.user.uid, {
+                type: 'hedging_retry_complete',
+                title: strategy.usedFallback ? '⚠️ Analyse partielle' : '✅ Analyse de couverture prête',
+                body: strategy.usedFallback 
+                    ? 'Stratégies calculées localement (IA indisponible)'
+                    : `${strategy.strategies?.length || 4} stratégies calculées`,
+                data: { predictionId }
+            });
+        }
+        
+        res.json({
+            success: true,
+            strategy,
+            retryCount: (prediction.hedgingRetryCount || 0) + 1,
+            liveData: liveData ? {
+                score: `${score.home} - ${score.away}`,
+                elapsed: `${elapsed}'`
+            } : null
+        });
+        
+    } catch (error) {
+        console.error("❌ Hedging retry error:", error);
+        res.status(500).json({
+            error: "Échec de la relance de l'analyse",
+            details: error.message,
+            canRetry: true
+        });
+    }
+});
+
+// Helper function pour construire le prompt de hedging
+function buildHedgingPrompt(options, score, elapsed, liveData, matchInfo) {
+    return `
+Tu es un expert en gestion de bankroll et stratégies de couverture (hedging) pour les paris sportifs.
+
+MATCH EN COURS:
+- ${matchInfo?.homeTeam || 'Équipe A'} vs ${matchInfo?.awayTeam || 'Équipe B'}
+- Score actuel: ${score?.home || 0} - ${score?.away || 0}
+- Minute: ${elapsed}'
+
+PARIS ACTUELS:
+${options.map((opt, i) => `${i+1}. ${opt.option}: Mise ${opt.stake || opt.actualStake}F @${opt.odds}`).join('\n')}
+
+DONNÉES LIVE:
+${liveData ? JSON.stringify(liveData.statistics || {}, null, 2) : 'Non disponibles'}
+
+Calcule les meilleures stratégies de couverture et retourne un JSON avec:
+- strategies: array de 5 stratégies (hold, cashout, hedge_partial, hedge_total, optimal)
+- recommendedStrategy: id de la meilleure stratégie
+- optimalStrategyFound: boolean
+- ratioQuality: "excellent" | "good" | "moderate" | "poor"
+- calculations: détails des calculs
+`;
+}
 
 /**
  * POST /api/hedging/breakeven-calculate

@@ -509,9 +509,13 @@ async function callClaude(prompt, apiKey, systemPrompt = PROMPTS.systemRole, use
 /**
  * Appel à l'API DeepSeek avec mode Reasoner (Thinking)
  * Utilise deepseek-reasoner pour une analyse avec raisonnement
+ * Avec timeout et système de retry robuste
  */
-async function callDeepSeek(prompt, apiKey, systemPrompt = PROMPTS.systemRole, useReasoner = true) {
-    console.log("🔮 Calling DeepSeek API with Reasoning...");
+const DEEPSEEK_TIMEOUT = 60000; // 60 secondes
+const DEEPSEEK_MAX_RETRIES = 2;
+
+async function callDeepSeek(prompt, apiKey, systemPrompt = PROMPTS.systemRole, useReasoner = true, retryCount = 0) {
+    console.log(`🔮 Calling DeepSeek API ${useReasoner ? '(Reasoner)' : '(Chat)'}...${retryCount > 0 ? ` (Retry ${retryCount}/${DEEPSEEK_MAX_RETRIES})` : ''}`);
     
     // Utiliser le modèle reasoner pour le thinking
     const model = useReasoner ? "deepseek-reasoner" : "deepseek-chat";
@@ -526,15 +530,26 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = PROMPTS.systemRole, u
         max_tokens: 8000
     };
 
+    // Controller pour le timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+        console.log(`⏰ DeepSeek timeout after ${DEEPSEEK_TIMEOUT/1000}s`);
+        controller.abort();
+    }, DEEPSEEK_TIMEOUT);
+
     try {
         const response = await fetch(DEEPSEEK_API_URL, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
-                "Authorization": `Bearer ${apiKey}`
+                "Authorization": `Bearer ${apiKey}`,
+                "Connection": "keep-alive"
             },
-            body: JSON.stringify(requestBody)
+            body: JSON.stringify(requestBody),
+            signal: controller.signal
         });
+
+        clearTimeout(timeoutId);
 
         if (!response.ok) {
             const error = await response.text();
@@ -542,7 +557,15 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = PROMPTS.systemRole, u
             // Si le modèle reasoner n'est pas disponible, fallback sur chat
             if (response.status === 400 && useReasoner) {
                 console.log("⚠️ DeepSeek Reasoner not available, falling back to chat model...");
-                return callDeepSeek(prompt, apiKey, systemPrompt, false);
+                return callDeepSeek(prompt, apiKey, systemPrompt, false, 0);
+            }
+            
+            // Erreurs 5xx sont retryables
+            if (response.status >= 500 && retryCount < DEEPSEEK_MAX_RETRIES) {
+                const delay = 2000 * Math.pow(2, retryCount);
+                console.log(`⏳ Server error ${response.status}, retrying in ${delay/1000}s...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+                return callDeepSeek(prompt, apiKey, systemPrompt, useReasoner, retryCount + 1);
             }
             
             throw new Error(`DeepSeek API error: ${response.status} - ${error}`);
@@ -578,7 +601,39 @@ async function callDeepSeek(prompt, apiKey, systemPrompt = PROMPTS.systemRole, u
         }
 
     } catch (error) {
-        console.error("❌ DeepSeek API Error:", error.message);
+        clearTimeout(timeoutId);
+        
+        // Identifier si l'erreur est retryable
+        const errorMessage = error.message || String(error);
+        const isRetryable = 
+            error.name === 'AbortError' || 
+            errorMessage.includes('terminated') ||
+            errorMessage.includes('ECONNRESET') ||
+            errorMessage.includes('socket') ||
+            errorMessage.includes('network') ||
+            errorMessage.includes('other side closed') ||
+            errorMessage.includes('fetch failed');
+        
+        console.error(`❌ DeepSeek API Error: ${errorMessage}${isRetryable ? ' (retryable)' : ''}`);
+        
+        // Retry si erreur de connexion et pas trop de retries
+        if (isRetryable && retryCount < DEEPSEEK_MAX_RETRIES) {
+            const delay = 2000 * Math.pow(2, retryCount);
+            console.log(`⏳ Connection error, retrying in ${delay/1000}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return callDeepSeek(prompt, apiKey, systemPrompt, useReasoner, retryCount + 1);
+        }
+        
+        // Si reasoner échoue après tous les retries, essayer avec chat model
+        if (useReasoner && retryCount >= DEEPSEEK_MAX_RETRIES) {
+            console.log("⚠️ DeepSeek Reasoner exhausted retries, trying chat model...");
+            try {
+                return await callDeepSeek(prompt, apiKey, systemPrompt, false, 0);
+            } catch (chatError) {
+                console.error("❌ DeepSeek chat fallback also failed");
+            }
+        }
+        
         throw error;
     }
 }
@@ -601,15 +656,36 @@ class PredictionService {
         console.log("📊 Step 1: Match Analysis with both AIs...");
         console.log("   Using selected bookmaker odds for analysis");
         
-        // Appels parallèles aux deux IA avec thinking
-        const [claudeAnalysis, deepseekAnalysis] = await Promise.all([
-            this.claudeKey ? callClaude(prompt, this.claudeKey, PROMPTS.systemRole, true) : null,
-            this.deepseekKey ? callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true) : null
+        // Appels parallèles aux deux IA avec tolérance aux pannes (Promise.allSettled)
+        const results = await Promise.allSettled([
+            this.claudeKey ? callClaude(prompt, this.claudeKey, PROMPTS.systemRole, true) : Promise.resolve(null),
+            this.deepseekKey ? callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true) : Promise.resolve(null)
         ]);
+        
+        // Extraire les résultats (null si échec)
+        const claudeAnalysis = results[0].status === 'fulfilled' ? results[0].value : null;
+        const deepseekAnalysis = results[1].status === 'fulfilled' ? results[1].value : null;
+        
+        // Log des erreurs si présentes
+        if (results[0].status === 'rejected') {
+            console.warn("⚠️ Claude analysis failed:", results[0].reason?.message || 'Unknown error');
+        }
+        if (results[1].status === 'rejected') {
+            console.warn("⚠️ DeepSeek analysis failed:", results[1].reason?.message || 'Unknown error');
+        }
+        
+        // Au moins une IA doit réussir
+        if (!claudeAnalysis && !deepseekAnalysis) {
+            throw new Error("Both AI engines failed - cannot proceed with analysis");
+        }
 
         return {
             claude: claudeAnalysis,
             deepseek: deepseekAnalysis,
+            errors: {
+                claude: results[0].status === 'rejected' ? results[0].reason?.message : null,
+                deepseek: results[1].status === 'rejected' ? results[1].reason?.message : null
+            },
             timestamp: new Date().toISOString()
         };
     }
@@ -627,24 +703,52 @@ class PredictionService {
 
     /**
      * ÉTAPE 3: Synthèse des analyses
+     * Avec fallback sur Claude si DeepSeek échoue
      */
     async synthesizeAnalyses(claudeAnalysis, deepseekAnalysis, selectedOptions) {
         const prompt = PROMPTS.synthesis(claudeAnalysis, deepseekAnalysis, selectedOptions);
         console.log("🔄 Step 3: Synthesis...");
         
-        // Utiliser DeepSeek pour la synthèse (validation croisée)
-        return await callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true);
+        // Essayer DeepSeek d'abord, puis Claude en fallback
+        try {
+            if (this.deepseekKey) {
+                return await callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true);
+            }
+        } catch (error) {
+            console.warn("⚠️ DeepSeek synthesis failed, falling back to Claude:", error.message);
+        }
+        
+        // Fallback sur Claude
+        if (this.claudeKey) {
+            return await callClaude(prompt, this.claudeKey, PROMPTS.systemRole, true);
+        }
+        
+        throw new Error("No AI available for synthesis");
     }
 
     /**
      * ÉTAPE 3.2: Calcul des mises optimales (Kelly)
+     * Avec fallback sur Claude si DeepSeek échoue
      */
     async calculateStakes(capital, minBet, maxPercentage, options) {
         const prompt = PROMPTS.kellyCalculation(capital, minBet, maxPercentage, options);
         console.log("🧮 Step 3.2: Kelly Calculation...");
         
-        // Utiliser DeepSeek Reasoner pour les calculs
-        return await callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true);
+        // Essayer DeepSeek d'abord pour les calculs
+        try {
+            if (this.deepseekKey) {
+                return await callDeepSeek(prompt, this.deepseekKey, PROMPTS.systemRole, true);
+            }
+        } catch (error) {
+            console.warn("⚠️ DeepSeek Kelly calculation failed, falling back to Claude:", error.message);
+        }
+        
+        // Fallback sur Claude
+        if (this.claudeKey) {
+            return await callClaude(prompt, this.claudeKey, PROMPTS.systemRole, true);
+        }
+        
+        throw new Error("No AI available for Kelly calculation");
     }
 
     /**
@@ -771,12 +875,27 @@ class PredictionService {
                         secondary: "DeepSeek (deepseek-reasoner) with Reasoning"
                     },
                     generatedAt: new Date().toISOString()
-                }
+                },
+                // Inclure les erreurs partielles si présentes
+                aiErrors: matchAnalysis.errors || null,
+                isPartialAnalysis: !!(matchAnalysis.errors?.claude || matchAnalysis.errors?.deepseek)
             };
 
         } catch (error) {
-            console.error("❌ Pipeline error:", error);
-            throw error;
+            console.error("❌ Pipeline error:", error.message);
+            
+            // Propager l'erreur avec plus de contexte
+            const enhancedError = new Error(`Pipeline failed: ${error.message}`);
+            enhancedError.originalError = error;
+            enhancedError.retryable = 
+                error.message?.includes('terminated') ||
+                error.message?.includes('timeout') ||
+                error.message?.includes('socket') ||
+                error.message?.includes('network') ||
+                error.message?.includes('ECONNRESET');
+            enhancedError.step = error.step || 'unknown';
+            
+            throw enhancedError;
         }
     }
 
